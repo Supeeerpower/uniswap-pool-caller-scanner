@@ -124,7 +124,7 @@
         <p id="count-line" class="hint"></p>
       </div>
       <div class="table-wrap">
-        <table>
+        <table id="results-table" class="data">
           <thead>
             <tr>
               <th><button type="button" data-sort="caller">Caller</button></th>
@@ -147,35 +147,33 @@
   </main>
 
   <section id="factory-view" class="factory" hidden>
-    <form id="factory-form" class="panel controls">
+    <form id="factory-form" class="panel controls factory-form">
       <label class="field">
         <span>Chain</span>
         <select id="factory-chain"></select>
       </label>
-      <p id="factory-hint" class="hint"></p>
       <label class="field">
         <span>Factory contract</span>
         <input id="factory-address" placeholder="0x…" autocomplete="off" spellcheck="false">
       </label>
-      <div class="row">
-        <label class="field">
-          <span>Start block <em>optional</em></span>
-          <input id="factory-from" inputmode="numeric" placeholder="deployment">
-        </label>
-        <label class="field">
-          <span>End block <em>optional</em></span>
-          <input id="factory-to" inputmode="numeric" placeholder="head">
-        </label>
-      </div>
-      <p class="hint">V2 and Solidly factories are read with <code>allPairs</code>. V3, Slipstream, and Algebra factories are read from creation events. Leave the start empty to begin at deployment. A start block limits discovery to that range and is the way to sample a huge factory.</p>
-      <div class="examples" id="factory-examples"></div>
-      <div class="row tight">
+      <label class="field">
+        <span>Start block <em>optional</em></span>
+        <input id="factory-from" inputmode="numeric" placeholder="deployment">
+      </label>
+      <label class="field">
+        <span>End block <em>optional</em></span>
+        <input id="factory-to" inputmode="numeric" placeholder="head">
+      </label>
+      <p id="factory-hint" class="hint span-all"></p>
+      <p class="hint span-all">V2 and Solidly factories are read with <code>allPairs</code>. V3, Slipstream, and Algebra factories are read from creation events. Leave the start empty to begin at deployment. A start block limits discovery to that range and is the way to sample a huge factory.</p>
+      <div class="examples span-all" id="factory-examples"></div>
+      <div class="row tight span-all">
         <button type="submit" id="discover">Discover pools</button>
         <button type="button" id="factory-cancel" class="ghost" hidden>Cancel</button>
       </div>
-      <p id="factory-error" class="error" hidden></p>
-      <h2 class="saved-title">Saved factories</h2>
-      <div id="saved-factories" class="hint">Loading…</div>
+      <p id="factory-error" class="error span-all" hidden></p>
+      <h2 class="saved-title span-all">Saved factories</h2>
+      <div id="saved-factories" class="hint span-all">Loading…</div>
     </form>
     <section class="panel results">
       <div class="results-head">
@@ -188,9 +186,9 @@
         <button type="button" id="scan-all" class="ghost" disabled>Scan all</button>
         <button type="button" id="export-pools" class="ghost" disabled>Export pools JSON</button>
       </div>
-      <p class="hint">A pool scan runs from that pool’s creation block through the chain head, looking for <code>getReserves</code> on V2/Solidly and <code>slot0</code> on V3/Slipstream/Algebra. Progress is stored after every chunk.</p>
+      <p class="hint">A pool scan runs from that pool’s creation block through the chain head, looking for <code>getReserves</code> on V2/Solidly and <code>slot0</code> on V3/Slipstream/Algebra. Scan all keeps every row queued, scanning, done, or failed. Open a finished pool to read its callers while later pools are still running. Status is stored in MongoDB, so a reload shows the same queue.</p>
       <div class="table-wrap">
-        <table>
+        <table id="pool-table" class="data">
           <thead>
             <tr>
               <th></th>
@@ -199,6 +197,7 @@
               <th>Pair</th>
               <th>Balances</th>
               <th>USD</th>
+              <th>Scan</th>
             </tr>
           </thead>
           <tbody id="pool-rows"></tbody>
@@ -206,7 +205,6 @@
       </div>
       <h2 class="saved-title">Saved scans</h2>
       <div id="saved-scans" class="hint">None yet.</div>
-      <div id="factory-callers"></div>
     </section>
   </section>
 

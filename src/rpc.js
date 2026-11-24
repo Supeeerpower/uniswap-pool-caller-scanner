@@ -158,6 +158,11 @@ async function readLimited(res, maxBytes) {
   return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
 }
 
+export function backoffDelay(attempt) {
+  const cap = Math.min(10_000, 400 * 2 ** attempt);
+  return Math.round(cap * (0.5 + Math.random() * 0.5));
+}
+
 export async function rpcRetry(fn, options = {}) {
   const retries = options.retries ?? 4;
   let last;
@@ -172,12 +177,75 @@ export async function rpcRetry(fn, options = {}) {
         throw err;
       }
       if (attempt === retries) throw err;
-      const delay = Math.min(10_000, 500 * 2 ** attempt);
+      const delay = backoffDelay(attempt);
       options.onRetry?.({ attempt: attempt + 1, delay, kind, message: err.message });
       await sleep(delay, options.signal);
     }
   }
   throw last;
+}
+
+// Serialises heavy trace_block / debug calls. Starts at one in flight, opens a
+// second slot only after a clean streak, and closes it again on the first
+// rate-limit, timeout, or 5xx. Each failure also widens the gap before the
+// next call and cools down the endpoint that failed.
+export function createEndpointPool(urls) {
+  const list = [...new Set((urls || []).map((url) => String(url || "").trim()).filter(Boolean))];
+  let gap = 100;
+  const minGap = 80;
+  const maxGap = 8_000;
+  let cursor = 0;
+  let nextAt = 0;
+  let inflight = 0;
+  let limit = 1;
+  let streak = 0;
+  const coolUntil = new Map();
+
+  async function acquire(signal) {
+    while (inflight >= limit) await sleep(30, signal);
+    const wait = Math.max(0, nextAt - Date.now());
+    nextAt = Date.now() + wait + gap;
+    inflight += 1;
+    if (wait) await sleep(wait, signal);
+    const now = Date.now();
+    let chosen = list[cursor % list.length];
+    let soonest = Infinity;
+    for (let i = 0; i < list.length; i += 1) {
+      const url = list[(cursor + i) % list.length];
+      const until = coolUntil.get(url) || 0;
+      if (until <= now) {
+        chosen = url;
+        cursor = (cursor + i + 1) % list.length;
+        soonest = 0;
+        break;
+      }
+      soonest = Math.min(soonest, until);
+    }
+    if (soonest > now) await sleep(Math.min(soonest - now, maxGap), signal);
+    let released = false;
+    return {
+      url: chosen,
+      release(kind) {
+        if (released) return;
+        released = true;
+        inflight = Math.max(0, inflight - 1);
+        if (kind === "ok") {
+          streak += 1;
+          gap = Math.max(minGap, Math.round(gap * 0.9));
+          if (streak >= 24 && limit < 2 && list.length > 1) limit = 2;
+          return;
+        }
+        streak = 0;
+        limit = 1;
+        gap = Math.min(maxGap, Math.max(400, gap * 2));
+        if (kind === "rate" || kind === "timeout" || kind === "transient") {
+          coolUntil.set(chosen, Date.now() + gap);
+        }
+      },
+    };
+  }
+
+  return { acquire, get limit() { return limit; }, get gap() { return gap; } };
 }
 
 export async function rpcBatch(url, calls, options = {}) {

@@ -1,11 +1,11 @@
 import { getAddress } from "ethers";
 import { functionsById, selectorMap } from "./abi.js";
-import { publicHost } from "./chains.js";
+import { publicHost, rpcCandidates } from "./chains.js";
 import { config } from "./config.js";
 import { detectPool } from "./detect.js";
 import { blockChunks, codeSize, hexQty, isDelegatedEoa, resolveRange, toHex } from "./decode.js";
 import { labelFor } from "./labels.js";
-import { cancelled, classifyError, getBlockNumber, mapPool, rpcBatch, rpcCall, rpcRetry } from "./rpc.js";
+import { backoffDelay, cancelled, classifyError, createEndpointPool, getBlockNumber, mapPool, rpcBatch, rpcCall, rpcRetry, sleep } from "./rpc.js";
 import { createAggregator, parseDebugBlock, parseParityTraces, poolCallsFromParsed } from "./traces.js";
 
 // Canonical pool-event topics. Checked in test/unit.test.js against ethers.id.
@@ -37,7 +37,11 @@ export async function runScan(request, { emit, signal }) {
   const failed = new Set();
   let blocksDone = 0;
   let method = null;
+  let traceUrls = [];
+  let endpointPool = null;
   let detection = null;
+  let consecutiveTraceFailures = 0;
+  let fatalTrace = null;
   let range = null;
   let aggregator = null;
   let limitNoted = false;
@@ -220,9 +224,10 @@ export async function runScan(request, { emit, signal }) {
     }
     if (cancelFlag || aggregator.stopped) return;
     try {
-      const parsed = await fetchRange(detection.rpcUrl, method, detection.pool, from, to, rpcOptions());
+      const parsed = await fetchRange(traceUrls, method, detection.pool, from, to, rpcOptions(), endpointPool);
       aggregator.add(poolCallsFromParsed(parsed, detection.pool.toLowerCase()));
       blocksDone += to - from + 1;
+      consecutiveTraceFailures = 0;
       try {
         await classifyCallers();
       } catch (codeErr) {
@@ -247,9 +252,17 @@ export async function runScan(request, { emit, signal }) {
         await processRange(mid + 1, to, depth + 1);
         return;
       }
+      consecutiveTraceFailures += 1;
+      const heavy = method === "trace_block" || method === "debug_traceBlockByNumber";
+      if (heavy || consecutiveTraceFailures >= 4) {
+        fatalTrace = `The RPC stopped answering ${method || "traces"} (${err.message}). Saved progress stops before block ${from.toLocaleString("en-US")}. Resume to continue.`;
+        warn(fatalTrace);
+        cancelFlag = true;
+        return;
+      }
       for (let n = from; n <= to; n += 1) failed.add(n);
       blocksDone += to - from + 1;
-      warn(`Blocks ${from}–${to} failed: ${err.message}`);
+      warn(`Blocks ${from.toLocaleString("en-US")}–${to.toLocaleString("en-US")} failed: ${err.message}`);
       publish("scanning");
       if (request.ordered) emit("checkpoint", { lastBlock: to, snapshot: materialize() });
     }
@@ -373,21 +386,34 @@ export async function runScan(request, { emit, signal }) {
       cap: config.maxBlocksCap,
     });
     if (range.note) log(range.note);
-    log(`Scanning blocks ${range.start.toLocaleString("en-US")}–${range.end.toLocaleString("en-US")} (${range.end - range.start + 1} blocks) via ${publicHost(detection.rpcUrl)}.`);
+    traceUrls = rpcCandidates(detection.chain, request.rpcUrl || detection.rpcUrl);
+    log(`Scanning blocks ${range.start.toLocaleString("en-US")}–${range.end.toLocaleString("en-US")} (${range.end - range.start + 1} blocks).`);
 
-    method = await probeMethod(detection.rpcUrl, detection.pool, range.start, rpcOptions(), log);
-    log(`Trace method: ${method}.`);
+    const probed = await probeMethod(traceUrls, detection.pool, range.start, rpcOptions(), log);
+    method = probed.method;
+    traceUrls = probed.urls;
+    if (method === "trace_block" || method === "debug_traceBlockByNumber") {
+      endpointPool = createEndpointPool(traceUrls);
+    }
+    log(`Trace method: ${method} via ${publicHost(traceUrls[0])}.`);
 
     if (method === "debug_traceTransaction") {
       await traceLoggedTransactions();
     } else {
-      const chunkSize = method === "trace_filter" ? config.chunkBlocks : 1;
+      const heavy = method !== "trace_filter";
+      const chunkSize = heavy ? 1 : config.chunkBlocks;
       const chunks = blockChunks(range.start, range.end, chunkSize);
       publish("scanning");
-      const parallel = request.ordered || request.maxTx ? 1 : config.concurrency;
+      const parallel = heavy || request.ordered || request.maxTx ? 1 : config.concurrency;
       await mapPool(chunks, parallel, async ([from, to]) => {
+        if (fatalTrace || cancelFlag) return;
         await processRange(from, to);
       });
+    }
+
+    if (fatalTrace) {
+      emit("error", { message: fatalTrace });
+      return;
     }
 
     if (signal?.aborted || cancelFlag) {
@@ -431,51 +457,68 @@ export async function runScan(request, { emit, signal }) {
   }
 }
 
-async function probeMethod(url, pool, block, options, log) {
+async function probeMethod(urls, pool, block, options, log) {
   const errors = [];
-  const poolLower = pool.toLowerCase();
+  const hosts = urls.map((url) => publicHost(url)).join(", ");
   for (const candidate of METHODS) {
-    try {
-      if (candidate === "trace_filter") {
-        const filter = {
-          fromBlock: toHex(block),
-          toBlock: toHex(block),
-          toAddress: [poolLower],
-        };
-        try {
-          await rpcRetry(
-            () => rpcCall(url, "trace_filter", [{ ...filter, count: 1 }], options),
-            { ...options, retries: 1 },
-          );
-        } catch (err) {
-          if (!/count|after|invalid param|invalid argument/i.test(err.message)) throw err;
-          await rpcRetry(() => rpcCall(url, "trace_filter", [filter], options), { ...options, retries: 0 });
+    let logged = false;
+    for (const url of urls) {
+      try {
+        await probeOne(candidate, url, pool, block, options);
+        const ordered = [url, ...urls.filter((item) => item !== url)];
+        if (url !== urls[0]) log(`${candidate} is available on ${publicHost(url)} (${hosts}).`);
+        return { method: candidate, urls: ordered };
+      } catch (err) {
+        if (err.code === "CANCELLED") throw err;
+        errors.push(`${candidate} @ ${publicHost(url)}: ${err.message}`);
+        if (!logged) {
+          log(`${candidate} is not usable here (${err.message}).`);
+          logged = true;
         }
-      } else if (candidate === "trace_block") {
-        await rpcRetry(() => rpcCall(url, "trace_block", [toHex(block)], options), { ...options, retries: 1 });
-      } else if (candidate === "debug_traceBlockByNumber") {
-        await debugCall(url, "debug_traceBlockByNumber", [toHex(block), {
-          tracer: "callTracer",
-          tracerConfig: { onlyTopCall: true },
-        }], options);
-      } else {
-        const tx = await findRecentTx(url, block, options);
-        if (!tx) throw new Error("no transaction in the nearby blocks to probe");
-        await debugCall(url, "debug_traceTransaction", [tx, {
-          tracer: "callTracer",
-          tracerConfig: { onlyTopCall: true },
-        }], options);
       }
-      return candidate;
-    } catch (err) {
-      if (err.code === "CANCELLED") throw err;
-      errors.push(`${candidate}: ${err.message}`);
-      log(`${candidate} is not usable here (${err.message}).`);
     }
   }
   throw new Error(
     `This RPC does not expose a usable trace method. slot0 and getReserves are ordinary internal calls, so they are invisible without trace_filter, trace_block, debug_traceBlockByNumber, or debug_traceTransaction.\n${errors.join("\n")}`,
   );
+}
+
+async function probeOne(candidate, url, pool, block, options) {
+  const poolLower = pool.toLowerCase();
+  if (candidate === "trace_filter") {
+    const filter = {
+      fromBlock: toHex(block),
+      toBlock: toHex(block),
+      toAddress: [poolLower],
+    };
+    try {
+      await rpcRetry(
+        () => rpcCall(url, "trace_filter", [{ ...filter, count: 1 }], options),
+        { ...options, retries: 1 },
+      );
+    } catch (err) {
+      if (!/count|after|invalid param|invalid argument/i.test(err.message)) throw err;
+      await rpcRetry(() => rpcCall(url, "trace_filter", [filter], options), { ...options, retries: 0 });
+    }
+    return;
+  }
+  if (candidate === "trace_block") {
+    await rpcRetry(() => rpcCall(url, "trace_block", [toHex(block)], { ...options, timeoutMs: 20_000 }), { ...options, retries: 1 });
+    return;
+  }
+  if (candidate === "debug_traceBlockByNumber") {
+    await debugCall(url, "debug_traceBlockByNumber", [toHex(block), {
+      tracer: "callTracer",
+      tracerConfig: { onlyTopCall: true },
+    }], options);
+    return;
+  }
+  const tx = await findRecentTx(url, block, options);
+  if (!tx) throw new Error("no transaction in the nearby blocks to probe");
+  await debugCall(url, "debug_traceTransaction", [tx, {
+    tracer: "callTracer",
+    tracerConfig: { onlyTopCall: true },
+  }], options);
 }
 
 async function debugCall(url, method, params, options) {
@@ -529,30 +572,59 @@ async function logsInRange(url, pool, from, to, options, depth = 0) {
   }
 }
 
-async function fetchRange(url, method, pool, from, to, options) {
-  if (method === "trace_filter") return fetchTraceFilter(url, pool, from, to, options);
+async function fetchRange(urls, activeMethod, poolAddress, from, to, options, pace) {
+  if (activeMethod === "trace_filter") return fetchTraceFilter(urls, poolAddress, from, to, options);
   const parsed = [];
   for (let block = from; block <= to; block += 1) {
     if (options.signal?.aborted) throw cancelled();
-    if (method === "trace_block") {
-      const traces = await rpcRetry(() => rpcCall(url, "trace_block", [toHex(block)], options), options);
+    if (activeMethod === "trace_block") {
+      const traces = await heavyCall(pace, urls, "trace_block", [toHex(block)], options);
       parsed.push(...parseParityTraces(traces));
     } else {
-      const entries = await fetchDebugBlock(url, block, options);
+      const entries = await fetchDebugBlock(pace, urls, block, options);
       parsed.push(...parseDebugBlock(entries, block));
     }
   }
   return parsed;
 }
 
-function fetchDebugBlock(url, block, options) {
-  return debugCall(url, "debug_traceBlockByNumber", [toHex(block), {
-    tracer: "callTracer",
-    tracerConfig: { onlyTopCall: false },
-  }], options);
+async function heavyCall(pace, urls, method, params, options) {
+  const timeoutMs = Math.min(options.timeoutMs ?? 30_000, 30_000);
+  let last;
+  const attempts = Math.max(urls.length, 1) + 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const slot = pace
+      ? await pace.acquire(options.signal)
+      : { url: urls[attempt % urls.length], release() {} };
+    try {
+      const result = await rpcCall(slot.url, method, params, { ...options, timeoutMs });
+      slot.release("ok");
+      return result;
+    } catch (err) {
+      last = err;
+      const kind = classifyError(err);
+      slot.release(kind);
+      if (err.code === "CANCELLED" || kind === "cancelled") throw err;
+      if ((kind === "pruned" || kind === "fatal") && kind !== "unsupported") throw err;
+      if (attempt === attempts - 1) throw err;
+      await sleep(backoffDelay(attempt), options.signal);
+    }
+  }
+  throw last;
 }
 
-async function fetchTraceFilter(url, pool, from, to, options) {
+function fetchDebugBlock(pace, urls, block, options) {
+  const params = [toHex(block), {
+    tracer: "callTracer",
+    tracerConfig: { onlyTopCall: false },
+  }];
+  return heavyCall(pace, urls, "debug_traceBlockByNumber", params, options).catch(async (err) => {
+    if (!/tracerConfig|invalid param|invalid argument/i.test(String(err.message))) throw err;
+    return heavyCall(pace, urls, "debug_traceBlockByNumber", [toHex(block), { tracer: "callTracer" }], options);
+  });
+}
+
+async function fetchTraceFilter(urls, pool, from, to, options) {
   const base = {
     fromBlock: toHex(from),
     toBlock: toHex(to),
@@ -567,7 +639,7 @@ async function fetchTraceFilter(url, pool, from, to, options) {
     const filter = paging ? { ...base, after, count: config.pageSize } : base;
     let result;
     try {
-      result = await rpcRetry(() => rpcCall(url, "trace_filter", [filter], options), options);
+      result = await traceFilterCall(urls, filter, options);
     } catch (err) {
       if (page === 0 && paging && /count|after|invalid param|invalid argument/i.test(err.message)) {
         paging = false;
@@ -587,6 +659,20 @@ async function fetchTraceFilter(url, pool, from, to, options) {
     after += result.length;
   }
   return out;
+}
+
+async function traceFilterCall(urls, filter, options) {
+  let last;
+  for (const url of urls) {
+    try {
+      return await rpcRetry(() => rpcCall(url, "trace_filter", [filter], options), options);
+    } catch (err) {
+      last = err;
+      const kind = classifyError(err);
+      if (kind === "cancelled" || kind === "range" || kind === "pruned" || kind === "fatal") throw err;
+    }
+  }
+  throw last || new Error("trace_filter failed");
 }
 
 async function codeAt(url, addresses, blockTag, options) {

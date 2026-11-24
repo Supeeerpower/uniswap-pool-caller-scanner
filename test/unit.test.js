@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { id } from "ethers";
 import { functionCatalog, selectorOf } from "../src/abi.js";
+import { chainById, chains, rpcCandidates, segmentBlockCap } from "../src/chains.js";
+import { scanProgress } from "../src/factoryJobs.js";
+import { backoffDelay } from "../src/rpc.js";
 import {
   classifyCode,
   codeSize,
@@ -19,6 +22,48 @@ import { createAggregator, parseDebugBlock, parseParityTraces, poolCallsFromPars
 const POOL = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640";
 const CALLER = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
 const OTHER = "0x111111125421ca6dc452d289314280a0f8842a65";
+
+test("scan progress is the share of blocks from creation through the target", () => {
+  assert.deepEqual(scanProgress({ creationBlock: 100, targetEnd: 199, lastScannedBlock: 149 }), {
+    pct: 50,
+    block: 149,
+    done: 50,
+    span: 100,
+  });
+  assert.equal(scanProgress({ creationBlock: 100, targetEnd: 199, lastScannedBlock: 99 }).pct, 0);
+  assert.equal(scanProgress({ creationBlock: 100, targetEnd: 199, lastScannedBlock: 199 }).pct, 100);
+  assert.equal(scanProgress({ creationBlock: null, targetEnd: 10, lastScannedBlock: 1 }).pct, null);
+});
+
+test("each supported chain has an http explorer base URL", () => {
+  const byId = new Map(chains.map((chain) => [chain.chainId, chain.explorer]));
+  assert.equal(byId.get(1), "https://etherscan.io");
+  assert.equal(byId.get(8453), "https://basescan.org");
+  assert.equal(byId.get(42161), "https://arbiscan.io");
+  assert.equal(byId.get(369), "https://scan.pulsechain.com");
+  assert.equal(byId.get(747474), "https://katanascan.com");
+  for (const chain of chains) {
+    assert.equal(typeof chain.name, "string");
+    assert.ok(chain.explorer == null || /^https:\/\/\S+$/.test(chain.explorer), chain.name);
+  }
+});
+
+test("pulsechain tries the trace_filter endpoint before the official trace_block RPC", () => {
+  const urls = rpcCandidates(chainById(369));
+  assert.equal(urls[0], "https://rpc-pulsechain.g4mm4.io");
+  assert.ok(urls.includes("https://rpc.pulsechain.com"));
+  assert.equal(segmentBlockCap(chainById(369)), null);
+  assert.equal(segmentBlockCap({ trace: "block" }), 40);
+});
+
+test("rpc backoff grows inside a capped window", () => {
+  for (let i = 0; i < 30; i += 1) {
+    const first = backoffDelay(0);
+    assert.ok(first >= 200 && first <= 400, String(first));
+    const later = backoffDelay(4);
+    assert.ok(later >= 3200 && later <= 6400, String(later));
+  }
+});
 
 test("canonical selectors are derived from the ABI", () => {
   assert.equal(selectorOf("v2", "getReserves"), "0x0902f1ac");
