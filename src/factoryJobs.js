@@ -13,6 +13,54 @@ function poolId(chainId, address) {
   return `${chainId}:${address.toLowerCase()}`;
 }
 
+export function scanProgress(scan) {
+  const start = scan?.creationBlock;
+  const end = scan?.targetEnd;
+  const last = scan?.lastScannedBlock;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) {
+    return { pct: null, block: Number.isInteger(last) ? last : null };
+  }
+  const span = end - start + 1;
+  const done = Number.isInteger(last) ? Math.max(0, Math.min(span, last - start + 1)) : 0;
+  return {
+    pct: Math.round((done / span) * 100),
+    block: Number.isInteger(last) ? last : null,
+    done,
+    span,
+  };
+}
+
+const progressTimers = new Map();
+
+// Debounced so a chunk-by-chunk trace does not rewrite the scan document on every
+// response. A late write cannot clobber a terminal status.
+export function scheduleScanProgress(scanId, fields) {
+  const prev = progressTimers.get(scanId);
+  if (prev) {
+    prev.fields = fields;
+    return prev.promise;
+  }
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  const slot = { fields, promise };
+  progressTimers.set(scanId, slot);
+  setTimeout(async () => {
+    progressTimers.delete(scanId);
+    try {
+      const db = await getDb();
+      await db.collection("scans").updateOne(
+        { _id: scanId, status: { $in: ["queued", "running"] } },
+        { $set: { status: "running", ...slot.fields, error: null, updatedAt: new Date() } },
+      );
+    } catch {
+      // The segment-end update still records the checkpoint.
+    } finally {
+      resolve();
+    }
+  }, 700);
+  return promise;
+}
+
 export async function saveDiscovery({ chain, rpcUrl, factory, fromBlock, result }) {
   const db = await getDb();
   const id = factoryId(chain.chainId, factory);
@@ -74,6 +122,27 @@ export async function factoryWithPools(id) {
   return { factory, pools, scans };
 }
 
+export async function getSavedScan(id) {
+  const db = await getDb();
+  return db.collection("scans").findOne({ _id: id });
+}
+
+export async function setActiveJob(factoryId, jobId) {
+  const db = await getDb();
+  await db.collection("factories").updateOne(
+    { _id: factoryId },
+    { $set: { activeJobId: jobId, updatedAt: new Date() } },
+  );
+}
+
+export async function clearActiveJob(factoryId, jobId) {
+  const db = await getDb();
+  await db.collection("factories").updateOne(
+    { _id: factoryId, activeJobId: jobId },
+    { $unset: { activeJobId: "" }, $set: { updatedAt: new Date() } },
+  );
+}
+
 export async function runDiscovery({ chain, rpcUrl, factory, fromBlock, toBlock, signal, onProgress }) {
   const result = await discoverFactory({
     rpcUrl,
@@ -108,6 +177,17 @@ export async function runSavedPoolScan({ scanId, signal, emit, finalEvent = "don
     $set: { status: "running", targetEnd: target, updatedAt: new Date(), error: null },
   });
   emit("log", { level: "info", message: `${pool.symbol0 || "token0"} / ${pool.symbol1 || "token1"} ${pool.address} from block ${last + 1} through ${target}.` });
+  emit("progress", {
+    phase: "scanning",
+    status: "running",
+    scanId,
+    address: pool.address,
+    creationBlock: pool.creationBlock,
+    targetEnd: target,
+    lastBlock: last,
+    callers: rows.length,
+    matchedCalls: scan.matchedCalls || 0,
+  });
   while (last < target) {
     if (signal?.aborted) break;
     const start = last + 1;
@@ -123,6 +203,7 @@ export async function runSavedPoolScan({ scanId, signal, emit, finalEvent = "don
       rows,
       signal,
       emit,
+      targetEnd: target,
     });
     if (outcome.cancelled) {
       await db.collection("scans").updateOne({ _id: scanId }, {
@@ -132,10 +213,28 @@ export async function runSavedPoolScan({ scanId, signal, emit, finalEvent = "don
       return;
     }
     if (outcome.error) {
+      const errorPayload = {
+        status: "error",
+        scanId,
+        address: pool.address,
+        error: outcome.error,
+        message: outcome.error,
+        lastScannedBlock: outcome.lastBlock ?? last,
+        targetEnd: target,
+        rows: outcome.rows || [],
+      };
       await db.collection("scans").updateOne({ _id: scanId }, {
-        $set: { status: "error", error: outcome.error, rows: outcome.rows, lastScannedBlock: outcome.lastBlock ?? last, updatedAt: new Date() },
+        $set: {
+          status: "error",
+          error: outcome.error,
+          rows: outcome.rows,
+          lastScannedBlock: outcome.lastBlock ?? last,
+          updatedAt: new Date(),
+        },
       });
-      emit("error", { message: outcome.error });
+      // A failed pool in a Scan All queue must not end the whole job.
+      if (finalEvent === "poolDone") emit("poolDone", errorPayload);
+      else emit("error", errorPayload);
       return;
     }
     last = outcome.lastBlock ?? end;
@@ -152,19 +251,59 @@ export async function runSavedPoolScan({ scanId, signal, emit, finalEvent = "don
         updatedAt: new Date(),
       },
     });
-    emit("checkpoint", { scanId, lastScannedBlock: last, targetEnd: target, rows: rows.length, status: done ? "done" : "running" });
+    emit("checkpoint", {
+      scanId,
+      address: pool.address,
+      lastScannedBlock: last,
+      targetEnd: target,
+      callers: rows.length,
+      rows: rows.length,
+      status: done ? "done" : "running",
+    });
   }
   const fresh = await db.collection("scans").findOne({ _id: scanId });
-  emit(finalEvent, { status: fresh.status, scanId, lastScannedBlock: fresh.lastScannedBlock, targetEnd: fresh.targetEnd, rows: fresh.rows || [] });
+  emit(finalEvent, {
+    status: fresh.status,
+    scanId,
+    address: pool.address,
+    lastScannedBlock: fresh.lastScannedBlock,
+    targetEnd: fresh.targetEnd,
+    rows: fresh.rows || [],
+    error: fresh.error || null,
+  });
 }
 
-function runSegment({ scan, pool, chainId, start, end, rows, signal, emit }) {
+function runSegment({ scan, pool, chainId, start, end, rows, signal, emit, targetEnd }) {
   return new Promise((resolve) => {
     let lastBlock = start - 1;
     let latestRows = rows;
     let method = null;
     let matchedCalls = 0;
     let failed = false;
+    let pendingWrite = Promise.resolve();
+    const publishProgress = (block, phase = "scanning") => {
+      if (Number.isInteger(block)) lastBlock = block;
+      const payload = {
+        phase,
+        status: "running",
+        scanId: scan._id,
+        address: pool.address,
+        creationBlock: pool.creationBlock,
+        targetEnd,
+        lastBlock,
+        callers: latestRows.length,
+        matchedCalls,
+        method,
+      };
+      emit("progress", payload);
+      pendingWrite = scheduleScanProgress(scan._id, {
+        lastScannedBlock: lastBlock,
+        rows: latestRows,
+        matchedCalls,
+        method,
+        targetEnd,
+      });
+    };
     runScan({
       address: pool.address,
       chainId,
@@ -181,14 +320,18 @@ function runSegment({ scan, pool, chainId, start, end, rows, signal, emit }) {
       emit: (event, data) => {
         if (event === "log" || event === "meta") emit(event, data);
         if (event === "snapshot" && data?.rows) latestRows = data.rows;
-        if (event === "progress") emit("progress", data);
+        if (event === "progress") {
+          const block = Number.isInteger(data?.blocksDone) ? start + data.blocksDone - 1 : lastBlock;
+          if (data?.matchedCalls != null) matchedCalls = data.matchedCalls;
+          if (data?.method) method = data.method;
+          publishProgress(block, data?.phase || "scanning");
+        }
         if (event === "checkpoint") {
-          lastBlock = data.lastBlock;
           if (data.snapshot?.rows) latestRows = data.snapshot.rows;
           method = data.snapshot?.stats?.method || method;
           matchedCalls = data.snapshot?.stats?.matchedCalls ?? matchedCalls;
           emit("snapshot", data.snapshot);
-          emit("progress", { ...(data.snapshot?.stats || {}), phase: "scanning", lastBlock });
+          publishProgress(data.lastBlock, "scanning");
         }
         if (event === "error") failed = data.message || "Scan failed";
         if (event === "done") {
@@ -196,7 +339,8 @@ function runSegment({ scan, pool, chainId, start, end, rows, signal, emit }) {
           if (data?.matchedCalls != null) matchedCalls = data.matchedCalls;
         }
       },
-    }).then(() => {
+    }).then(async () => {
+      await pendingWrite;
       if (signal?.aborted) {
         resolve({ cancelled: true, lastBlock, rows: latestRows, method, matchedCalls });
         return;
@@ -221,6 +365,7 @@ export async function createScans({ factoryId, addresses }) {
   const wanted = new Set((addresses || []).map((a) => a.toLowerCase()));
   const pools = await db.collection("pools").find({ factoryId }).toArray();
   const chosen = pools.filter((pool) => wanted.size === 0 || wanted.has(pool.address.toLowerCase()));
+  chosen.sort((a, b) => (a.creationBlock - b.creationBlock) || String(a.address).localeCompare(String(b.address)));
   if (!chosen.length) throw new Error("No pools matched that selection.");
   const now = new Date();
   const ids = [];
@@ -244,7 +389,7 @@ export async function createScans({ factoryId, addresses }) {
           functionId: fn,
           creationBlock: pool.creationBlock,
           targetEnd: head,
-          status: "paused",
+          status: "queued",
           lastScannedBlock: pool.creationBlock - 1,
           rows: [],
           matchedCalls: 0,
@@ -302,6 +447,7 @@ export function publicScan(scan) {
     method: scan.method || null,
     matchedCalls: scan.matchedCalls || 0,
     callers: (scan.rows || []).length,
+    progress: scanProgress(scan),
     error: scan.error || null,
     updatedAt: scan.updatedAt,
   };

@@ -519,16 +519,7 @@ function txCell(row, explorer) {
     td.textContent = "—";
     return td;
   }
-  const href = explorer && /^0x[0-9a-fA-F]{64}$/.test(row.exampleTx) ? `${explorer}/tx/${row.exampleTx}` : null;
-  const link = document.createElement(href ? "a" : "span");
-  if (href) {
-    link.href = href;
-    link.target = "_blank";
-    link.rel = "noreferrer";
-  }
-  link.className = "addr";
-  link.textContent = shortHex(row.exampleTx);
-  td.append(link);
+  td.append(explorerLink(explorer, "tx", row.exampleTx, shortHex(row.exampleTx), "addr"));
   if (row.exampleOrigin) {
     const small = document.createElement("small");
     small.textContent = `from ${shortHex(row.exampleOrigin)}`;
@@ -537,18 +528,31 @@ function txCell(row, explorer) {
   return td;
 }
 
-function addressLink(explorer, address) {
-  const href = explorer && /^0x[0-9a-fA-F]{40}$/.test(address) ? `${explorer}/address/${address}` : null;
+function explorerHref(explorer, kind, value) {
+  if (!explorer || !value) return null;
+  const base = String(explorer).trim().replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(base)) return null;
+  if (kind === "tx") return /^0x[0-9a-fA-F]{64}$/.test(value) ? `${base}/tx/${value}` : null;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value)) return null;
+  return `${base}/address/${value}`;
+}
+
+function explorerLink(explorer, kind, value, label, className) {
+  const href = explorerHref(explorer, kind, value);
   const node = document.createElement(href ? "a" : "span");
   if (href) {
     node.href = href;
     node.target = "_blank";
     node.rel = "noreferrer";
   }
-  node.className = "addr";
-  node.textContent = shortHex(address);
-  node.title = address;
+  if (className) node.className = className;
+  node.textContent = label || "";
+  if (value) node.title = value;
   return node;
+}
+
+function addressLink(explorer, address) {
+  return explorerLink(explorer, "address", address, shortHex(address), "addr");
 }
 
 function shortHex(value) {
@@ -621,7 +625,21 @@ function option(value, label) {
   return node;
 }
 
-const factoryState = { id: null, pools: [], scans: [], source: null, jobId: null };
+const factoryState = {
+  id: null,
+  chainId: null,
+  explorer: null,
+  pools: [],
+  scans: [],
+  source: null,
+  jobId: null,
+  activeJobId: null,
+  poll: null,
+  openScanId: null,
+  detail: null,
+  checked: new Set(),
+  renderTimer: null,
+};
 
 function initFactory() {
   const select = $("factory-chain");
@@ -683,9 +701,13 @@ async function refreshFactories() {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "ghost";
-      button.textContent = `${factory.chainName} ${shortHex(factory.address)} · ${factory.poolCount} pools`;
+      button.textContent = `${factory.chainName} ${shortHex(factory.address)} · ${factory.poolCount} pools${factory.activeJobId ? " · scanning" : ""}`;
       button.addEventListener("click", () => loadFactory(factory.id));
       box.append(button);
+    }
+    if (!factoryState.id) {
+      const live = data.factories.find((factory) => factory.activeJobId);
+      if (live) await loadFactory(live.id);
     }
   } catch (err) {
     box.textContent = err.message;
@@ -737,13 +759,25 @@ async function discoverFactory() {
 }
 
 async function loadFactory(id) {
+  await reloadFactoryData(id);
+  ensurePoll();
+  maybeFollow(factoryState.activeJobId);
+}
+
+async function reloadFactoryData(id = factoryState.id) {
+  if (!id) return;
   const res = await fetch(`/api/factories/${encodeURIComponent(id)}`);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error);
+  const wrap = document.querySelector("#factory-view .table-wrap");
+  const scrollLeft = wrap ? wrap.scrollLeft : 0;
   factoryState.id = id;
   factoryState.pools = data.pools;
   factoryState.scans = data.scans;
   const factory = data.factory;
+  factoryState.chainId = factory.chainId;
+  factoryState.explorer = factory.explorer || chainExplorer(factory.chainId);
+  factoryState.activeJobId = factory.activeJobId || null;
   $("factory-summary").textContent = `${factory.chainName} ${factory.kind} via ${factory.mode} · ${factory.poolCount} pools · ${factory.rpcHost}`;
   $("factory-address").value = factory.address;
   if ([...$("factory-chain").options].some((option) => option.value === String(factory.chainId))) {
@@ -754,36 +788,236 @@ async function loadFactory(id) {
   $("scan-selected").disabled = false;
   $("scan-all").disabled = false;
   $("export-pools").disabled = false;
+  if (wrap) wrap.scrollLeft = scrollLeft;
+  if (factoryState.openScanId) refreshOpenDetail();
+}
+
+function chainExplorer(chainId) {
+  const chain = state.meta?.chains?.find((item) => item.chainId === Number(chainId));
+  return chain?.explorer || null;
+}
+
+function factoryExplorer() {
+  return factoryState.explorer || chainExplorer(factoryState.chainId);
+}
+
+function scanForPool(pool) {
+  const address = pool.address.toLowerCase();
+  return factoryState.scans.find((scan) => scan.address.toLowerCase() === address) || null;
 }
 
 function renderPoolTable() {
   const body = $("pool-rows");
   body.replaceChildren();
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+  const explorer = factoryExplorer();
   for (const pool of factoryState.pools) {
+    const scan = scanForPool(pool);
     const tr = document.createElement("tr");
+    if (scan?.status === "running") tr.className = "scanning";
     const pick = document.createElement("td");
     const box = document.createElement("input");
     box.type = "checkbox";
     box.className = "pick";
     box.value = pool.address;
+    box.checked = factoryState.checked.has(pool.address.toLowerCase());
+    box.addEventListener("change", () => {
+      const key = pool.address.toLowerCase();
+      if (box.checked) factoryState.checked.add(key);
+      else factoryState.checked.delete(key);
+    });
     pick.append(box);
-    const addr = document.createElement("td");
-    addr.className = "addr";
-    addr.textContent = shortHex(pool.address);
-    addr.title = pool.address;
-    const created = document.createElement("td");
-    created.textContent = pool.creationBlock == null ? "—" : num.format(pool.creationBlock);
-    const pair = document.createElement("td");
-    pair.textContent = `${pool.symbol0 || shortHex(pool.token0)} / ${pool.symbol1 || shortHex(pool.token1)}`;
-    const balances = document.createElement("td");
-    balances.textContent = `${pool.reserve0 ?? "—"} / ${pool.reserve1 ?? "—"}`;
-    const value = document.createElement("td");
-    value.className = "usd";
-    value.textContent = pool.usd == null ? "—" : usd.format(pool.usd);
-    value.title = [pool.price0Source, pool.price1Source].filter(Boolean).join(", ");
-    tr.append(pick, addr, created, pair, balances, value);
+    tr.append(pick, poolCell(pool, explorer), blockCell(pool.creationBlock), pairCell(pool, explorer), balanceCell(pool), usdCell(pool, usd), statusCell(pool, scan));
     body.append(tr);
+    if (scan && factoryState.openScanId === scan.id) body.append(detailRow(pool, scan));
+  }
+}
+
+function poolCell(pool, explorer) {
+  const td = document.createElement("td");
+  const pairName = `${pool.symbol0 || "token0"} / ${pool.symbol1 || "token1"}`;
+  const name = explorerLink(explorer, "address", pool.address, pairName, "pool-name");
+  const addr = explorerLink(explorer, "address", pool.address, shortHex(pool.address), "addr");
+  td.append(name, addr);
+  return td;
+}
+
+function pairCell(pool, explorer) {
+  const td = document.createElement("td");
+  td.append(
+    explorerLink(explorer, "address", pool.token0, pool.symbol0 || shortHex(pool.token0), "token-link"),
+    document.createTextNode(" / "),
+    explorerLink(explorer, "address", pool.token1, pool.symbol1 || shortHex(pool.token1), "token-link"),
+  );
+  return td;
+}
+
+function blockCell(block) {
+  const td = document.createElement("td");
+  td.textContent = block == null ? "—" : num.format(block);
+  return td;
+}
+
+function balanceCell(pool) {
+  const td = document.createElement("td");
+  td.className = "balances";
+  td.textContent = `${pool.reserve0 ?? "—"} / ${pool.reserve1 ?? "—"}`;
+  return td;
+}
+
+function usdCell(pool, usd) {
+  const td = document.createElement("td");
+  td.className = "usd";
+  td.textContent = pool.usd == null ? "—" : usd.format(pool.usd);
+  td.title = [pool.price0Source, pool.price1Source].filter(Boolean).join(", ");
+  return td;
+}
+
+function statusCell(pool, scan) {
+  const td = document.createElement("td");
+  td.className = "status-cell";
+  const line = document.createElement("div");
+  line.className = "status-line";
+  const label = statusLabel(scan);
+  const pill = document.createElement("span");
+  pill.className = `status-pill ${label.kind}`;
+  pill.textContent = label.text;
+  if (scan?.error) pill.title = scan.error;
+  line.append(pill);
+  if (scan && canView(scan)) {
+    const view = document.createElement("button");
+    view.type = "button";
+    view.className = "texty";
+    const open = factoryState.openScanId === scan.id;
+    view.textContent = open ? "Hide" : "View callers";
+    view.addEventListener("click", () => toggleCallers(scan));
+    line.append(view);
+  }
+  if (scan && scan.status !== "done" && scan.status !== "queued" && scan.status !== "running") {
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.className = "texty";
+    resume.textContent = "Resume";
+    resume.addEventListener("click", () => resumeScan(scan));
+    line.append(resume);
+  }
+  td.append(line);
+  return td;
+}
+
+function statusLabel(scan) {
+  if (!scan) return { kind: "idle", text: "Not scanned" };
+  if (scan.status === "queued") return { kind: "queued", text: "Queued" };
+  if (scan.status === "running") {
+    const pct = scan.progress?.pct;
+    const block = scan.lastScannedBlock;
+    const started = Number.isInteger(block) && Number.isInteger(scan.creationBlock) && block >= scan.creationBlock;
+    const parts = ["Scanning"];
+    if (Number.isInteger(pct)) parts.push(`${pct}%`);
+    parts.push(started ? `block ${num.format(block)}` : "starting");
+    return { kind: "running", text: parts.join(" · ") };
+  }
+  if (scan.status === "done") {
+    const count = scan.callers || 0;
+    return { kind: "done", text: `Done · ${num.format(count)} caller${count === 1 ? "" : "s"}` };
+  }
+  if (scan.status === "error") return { kind: "error", text: "Error" };
+  if (scan.status === "paused") {
+    const block = Number.isInteger(scan.lastScannedBlock) ? ` · block ${num.format(scan.lastScannedBlock)}` : "";
+    return { kind: "paused", text: `Paused${block}` };
+  }
+  return { kind: "idle", text: scan.status || "Not scanned" };
+}
+
+function canView(scan) {
+  if (!scan) return false;
+  if (scan.status === "done" || scan.status === "paused" || scan.status === "error") return true;
+  return scan.status === "running" && (scan.callers || 0) > 0;
+}
+
+function detailRow(pool, scan) {
+  const tr = document.createElement("tr");
+  tr.className = "pool-detail";
+  const td = document.createElement("td");
+  td.colSpan = 7;
+  const panel = document.createElement("div");
+  panel.className = "caller-panel";
+  const title = document.createElement("h3");
+  const fn = String(scan.functionId || "").split(":").pop() || "call";
+  const pair = `${pool.symbol0 || "token0"} / ${pool.symbol1 || "token1"}`;
+  title.textContent = `${pair} · ${fn}`;
+  panel.append(title);
+  const detail = factoryState.detail;
+  if (!detail || detail.id !== scan.id || detail.loading) {
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = "Loading callers from the saved scan…";
+    panel.append(note);
+  } else if (detail.error) {
+    const note = document.createElement("p");
+    note.className = "error";
+    note.textContent = detail.error;
+    panel.append(note);
+  } else if (!detail.rows?.length) {
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = "No contract callers saved for this pool yet.";
+    panel.append(note);
+  } else {
+    panel.append(callerTable(detail.rows, factoryExplorer()));
+  }
+  td.append(panel);
+  tr.append(td);
+  return tr;
+}
+
+function callerTable(rows, explorer) {
+  const wrap = document.createElement("div");
+  wrap.className = "table-wrap";
+  const table = document.createElement("table");
+  table.className = "data detail-table";
+  const head = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const label of ["Caller", "Function", "Calls", "First block", "Last block", "Example tx"]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    hr.append(th);
+  }
+  head.append(hr);
+  const body = document.createElement("tbody");
+  for (const row of rows) body.append(renderRow(row, explorer));
+  table.append(head, body);
+  wrap.append(table);
+  return wrap;
+}
+
+async function toggleCallers(scan) {
+  if (factoryState.openScanId === scan.id) {
+    factoryState.openScanId = null;
+    factoryState.detail = null;
+    renderPoolTable();
+    return;
+  }
+  factoryState.openScanId = scan.id;
+  factoryState.detail = { id: scan.id, rows: null, loading: true };
+  renderPoolTable();
+  await refreshOpenDetail();
+}
+
+async function refreshOpenDetail() {
+  const id = factoryState.openScanId;
+  if (!id) return;
+  try {
+    const res = await fetch(`/api/saved-scans/${encodeURIComponent(id)}`);
+    const data = await res.json();
+    if (factoryState.openScanId !== id) return;
+    if (!res.ok) throw new Error(data.error);
+    factoryState.detail = { id, rows: data.rows || [], loading: false };
+    renderPoolTable();
+  } catch (err) {
+    if (factoryState.openScanId !== id) return;
+    factoryState.detail = { id, rows: [], loading: false, error: err.message };
+    renderPoolTable();
   }
 }
 
@@ -841,32 +1075,109 @@ async function postFactoryJob(url, body) {
   if (!res.ok) throw new Error(data.error);
   factoryState.jobId = data.id;
   $("factory-cancel").hidden = false;
-  await listenJob(data.id, async (event, payload) => {
-    if (event === "log") factoryLog(payload.message);
-    if (event === "poolDone" || event === "done") {
-      renderCallerSnapshot(payload);
-      if (factoryState.id) await loadFactory(factoryState.id);
-    }
-    if (event === "error") setFactoryError(payload.message);
-  });
-  $("factory-cancel").hidden = true;
+  ensurePoll();
+  if (factoryState.id) await reloadFactoryData();
+  try {
+    await listenJob(data.id, handleFactoryEvent);
+  } finally {
+    if (factoryState.jobId === data.id) factoryState.jobId = null;
+    $("factory-cancel").hidden = true;
+    if (factoryState.id) await reloadFactoryData();
+  }
 }
 
-function renderCallerSnapshot(payload) {
-  const box = $("factory-callers");
-  const rows = payload.rows || [];
-  if (!rows.length) return;
-  box.replaceChildren();
-  const title = document.createElement("h2");
-  title.className = "saved-title";
-  title.textContent = "Latest caller results";
-  box.append(title);
-  for (const row of rows.slice(0, 12)) {
-    const line = document.createElement("div");
-    line.className = "scan-line";
-    line.textContent = `${row.count} × ${row.functionName} · ${row.label || row.caller}`;
-    box.append(line);
+function maybeFollow(jobId) {
+  if (!jobId || factoryState.source || factoryState.jobId === jobId) return;
+  factoryState.jobId = jobId;
+  $("factory-cancel").hidden = false;
+  ensurePoll();
+  listenJob(jobId, handleFactoryEvent).finally(async () => {
+    const ended = factoryState.jobId === jobId;
+    if (ended) factoryState.jobId = null;
+    $("factory-cancel").hidden = Boolean(factoryState.jobId);
+    if (factoryState.id) await reloadFactoryData().catch((err) => setFactoryError(err.message));
+    if (!ended || factoryState.activeJobId !== jobId || factoryState.source) return;
+    const check = await fetch(`/api/scans/${encodeURIComponent(jobId)}`).catch(() => null);
+    if (check?.ok) maybeFollow(jobId);
+  });
+}
+
+function ensurePoll() {
+  const live = () => factoryState.activeJobId || factoryState.jobId || factoryState.scans.some((scan) => scan.status === "queued" || scan.status === "running");
+  if (factoryState.poll) return;
+  if (!live()) return;
+  factoryState.poll = setInterval(async () => {
+    if (!live()) {
+      clearInterval(factoryState.poll);
+      factoryState.poll = null;
+      return;
+    }
+    if (!factoryState.id) return;
+    try {
+      await reloadFactoryData();
+      if (factoryState.activeJobId && !factoryState.source) maybeFollow(factoryState.activeJobId);
+    } catch (err) {
+      setFactoryError(err.message);
+    }
+  }, 2000);
+}
+
+async function handleFactoryEvent(event, payload) {
+  if (event === "log") factoryLog(payload.message);
+  if (event === "progress" || event === "checkpoint") applyLiveProgress(payload);
+  if (event === "poolDone") {
+    if (payload?.scanId && payload.rows && factoryState.openScanId === payload.scanId) {
+      factoryState.detail = { id: payload.scanId, rows: payload.rows, loading: false };
+    }
+    if (factoryState.id) await reloadFactoryData();
   }
+  if (event === "done" && factoryState.id) await reloadFactoryData();
+  if (event === "error") setFactoryError(payload.message || payload.error || "Scan failed");
+}
+
+function applyLiveProgress(payload) {
+  const address = String(payload?.address || "").toLowerCase();
+  if (!address) return;
+  const scan = factoryState.scans.find((item) => item.address.toLowerCase() === address);
+  if (!scan) return;
+  if (payload.status === "done" || payload.status === "error" || payload.status === "paused" || payload.status === "running") {
+    scan.status = payload.status === "running" ? "running" : payload.status;
+  } else {
+    scan.status = "running";
+  }
+  if (Number.isInteger(payload.lastBlock) || Number.isInteger(payload.lastScannedBlock)) {
+    scan.lastScannedBlock = payload.lastScannedBlock ?? payload.lastBlock;
+  }
+  if (Number.isInteger(payload.targetEnd)) scan.targetEnd = payload.targetEnd;
+  if (payload.callers != null) scan.callers = payload.callers;
+  else if (payload.rows != null && !Array.isArray(payload.rows)) scan.callers = payload.rows;
+  if (payload.matchedCalls != null) scan.matchedCalls = payload.matchedCalls;
+  if (payload.error) scan.error = payload.error;
+  scan.progress = progressFromScan(scan);
+  schedulePoolRender();
+}
+
+function progressFromScan(scan) {
+  const start = scan.creationBlock;
+  const end = scan.targetEnd;
+  const last = scan.lastScannedBlock;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) {
+    return { pct: null, block: Number.isInteger(last) ? last : null };
+  }
+  const span = end - start + 1;
+  const done = Number.isInteger(last) ? Math.max(0, Math.min(span, last - start + 1)) : 0;
+  return { pct: Math.round((done / span) * 100), block: Number.isInteger(last) ? last : null, done, span };
+}
+
+function schedulePoolRender() {
+  if (factoryState.renderTimer) return;
+  factoryState.renderTimer = setTimeout(() => {
+    factoryState.renderTimer = null;
+    const wrap = document.querySelector("#factory-view .table-wrap");
+    const scrollLeft = wrap ? wrap.scrollLeft : 0;
+    renderPoolTable();
+    if (wrap) wrap.scrollLeft = scrollLeft;
+  }, 250);
 }
 
 async function exportPools() {

@@ -8,7 +8,7 @@ import { config } from "./config.js";
 import { normalizeAddress, normalizeRpcUrl } from "./decode.js";
 import { mongoStatus } from "./db.js";
 import { detectPool } from "./detect.js";
-import { createScans, factoryWithPools, listFactories, publicPool, publicScan, runDiscovery, runSavedPoolScan } from "./factoryJobs.js";
+import { clearActiveJob, createScans, factoryWithPools, getSavedScan, listFactories, publicPool, publicScan, runDiscovery, runSavedPoolScan, setActiveJob } from "./factoryJobs.js";
 import { getBlockNumber, getChainId } from "./rpc.js";
 import { runScan } from "./scan.js";
 
@@ -210,41 +210,74 @@ app.post("/api/factories/discover", (req, res) => {
 });
 
 app.post("/api/factories/:id/scan", async (req, res) => {
+  const factoryId = req.params.id;
   try {
     takeBusy();
     const created = await createScans({
-      factoryId: req.params.id,
+      factoryId,
       addresses: Array.isArray(req.body?.addresses) ? req.body.addresses : [],
     });
     const id = randomUUID();
     const job = createJob();
     jobs.set(id, job);
+    await setActiveJob(factoryId, id);
     res.json({ id, scanIds: created.scanIds, head: created.head });
-    runScanQueue(created.scanIds, job).finally(freeBusy);
+    runScanQueue(factoryId, created.scanIds, job).finally(() => {
+      clearActiveJob(factoryId, id).catch(() => {});
+      freeBusy();
+    });
   } catch (err) {
     if (err.status !== 409) freeBusy();
-    res.status(err.status || 400).json({ error: err.message });
+    if (!res.headersSent) res.status(err.status || 400).json({ error: err.message });
   }
 });
 
-app.post("/api/saved-scans/:id/resume", (req, res) => {
+app.post("/api/saved-scans/:id/resume", async (req, res) => {
   try {
     takeBusy();
   } catch (err) {
     res.status(409).json({ error: err.message });
     return;
   }
+  const scanId = decodeURIComponent(req.params.id);
   const id = randomUUID();
   const job = createJob();
   jobs.set(id, job);
-  res.json({ id, scanId: req.params.id });
+  let factoryId = null;
+  try {
+    const scan = await getSavedScan(scanId);
+    if (!scan) throw new Error("Unknown saved scan.");
+    factoryId = scan.factoryId;
+    await setActiveJob(factoryId, id);
+  } catch (err) {
+    freeBusy();
+    res.status(404).json({ error: err.message });
+    return;
+  }
+  res.json({ id, scanId });
   runSavedPoolScan({
-    scanId: decodeURIComponent(req.params.id),
+    scanId,
     signal: job.abort.signal,
     emit: (event, data) => job.push(event, data),
   }).catch((err) => {
     job.push("error", { message: err.message || String(err) });
-  }).finally(freeBusy);
+  }).finally(() => {
+    if (factoryId) clearActiveJob(factoryId, id).catch(() => {});
+    freeBusy();
+  });
+});
+
+app.get("/api/saved-scans/:id", async (req, res) => {
+  try {
+    const scan = await getSavedScan(decodeURIComponent(req.params.id));
+    if (!scan) {
+      res.status(404).json({ error: "Unknown saved scan." });
+      return;
+    }
+    res.json({ scan: publicScan(scan), rows: scan.rows || [] });
+  } catch (err) {
+    res.status(503).json({ error: err.message });
+  }
 });
 
 app.get("/api/saved-scans/:id/export", async (req, res) => {
@@ -436,20 +469,24 @@ function publicDetection(found) {
   };
 }
 
-async function runScanQueue(scanIds, job) {
+async function runScanQueue(factoryId, scanIds, job) {
   const finished = [];
-  for (const scanId of scanIds) {
-    if (job.abort.signal.aborted) break;
-    job.push("log", { level: "info", message: `Pool scan ${scanId}` });
-    await runSavedPoolScan({
-      scanId,
-      signal: job.abort.signal,
-      emit: (event, data) => job.push(event, data),
-      finalEvent: "poolDone",
-    });
-    finished.push(scanId);
+  try {
+    for (const scanId of scanIds) {
+      if (job.abort.signal.aborted) break;
+      job.push("log", { level: "info", message: `Pool scan ${scanId}` });
+      await runSavedPoolScan({
+        scanId,
+        signal: job.abort.signal,
+        emit: (event, data) => job.push(event, data),
+        finalEvent: "poolDone",
+      });
+      finished.push(scanId);
+    }
+    job.push("done", { status: job.abort.signal.aborted ? "paused" : "done", scanIds: finished, factoryId });
+  } catch (err) {
+    job.push("error", { message: err.message || String(err) });
   }
-  job.push("done", { status: job.abort.signal.aborted ? "paused" : "done", scanIds: finished });
 }
 
 function publicFactory(doc) {
@@ -465,6 +502,7 @@ function publicFactory(doc) {
     status: doc.status,
     rpcHost: doc.rpcHost,
     explorer: doc.explorer,
+    activeJobId: doc.activeJobId || null,
     updatedAt: doc.updatedAt,
   };
 }
