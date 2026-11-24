@@ -884,6 +884,13 @@ function statusCell(pool, scan) {
   pill.textContent = label.text;
   if (scan?.error) pill.title = scan.error;
   line.append(pill);
+  td.append(line);
+  if (scan?.error && (scan.status === "error" || scan.status === "paused")) {
+    const note = document.createElement("p");
+    note.className = "hint status-note";
+    note.textContent = scan.error;
+    td.append(note);
+  }
   if (scan && canView(scan)) {
     const view = document.createElement("button");
     view.type = "button";
@@ -901,7 +908,6 @@ function statusCell(pool, scan) {
     resume.addEventListener("click", () => resumeScan(scan));
     line.append(resume);
   }
-  td.append(line);
   return td;
 }
 

@@ -246,6 +246,7 @@ tr.pool-detail td { background: #171b12; white-space: normal; }
 .caller-panel .table-wrap { margin: 0; }
 .detail-table { min-width: 720px; }
 .balances { font-variant-numeric: tabular-nums; }
+.status-note { margin-top: 4px; max-width: 360px; white-space: normal; color: var(--danger); }
 
 @media (max-width: 960px) {
   .top, main { grid-template-columns: 1fr; }

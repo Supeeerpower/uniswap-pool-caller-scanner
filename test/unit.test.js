@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { id } from "ethers";
 import { functionCatalog, selectorOf } from "../src/abi.js";
-import { chains } from "../src/chains.js";
+import { chainById, chains, rpcCandidates, segmentBlockCap } from "../src/chains.js";
 import { scanProgress } from "../src/factoryJobs.js";
+import { backoffDelay } from "../src/rpc.js";
 import {
   classifyCode,
   codeSize,
@@ -44,6 +45,23 @@ test("each supported chain has an http explorer base URL", () => {
   for (const chain of chains) {
     assert.equal(typeof chain.name, "string");
     assert.ok(chain.explorer == null || /^https:\/\/\S+$/.test(chain.explorer), chain.name);
+  }
+});
+
+test("pulsechain tries the trace_filter endpoint before the official trace_block RPC", () => {
+  const urls = rpcCandidates(chainById(369));
+  assert.equal(urls[0], "https://rpc-pulsechain.g4mm4.io");
+  assert.ok(urls.includes("https://rpc.pulsechain.com"));
+  assert.equal(segmentBlockCap(chainById(369)), null);
+  assert.equal(segmentBlockCap({ trace: "block" }), 40);
+});
+
+test("rpc backoff grows inside a capped window", () => {
+  for (let i = 0; i < 30; i += 1) {
+    const first = backoffDelay(0);
+    assert.ok(first >= 200 && first <= 400, String(first));
+    const later = backoffDelay(4);
+    assert.ok(later >= 3200 && later <= 6400, String(later));
   }
 });
 

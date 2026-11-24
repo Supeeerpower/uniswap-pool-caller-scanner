@@ -257,9 +257,15 @@ export const chains = [
     chainId: 369,
     name: "PulseChain",
     explorer: "https://scan.pulsechain.com",
-    defaultRpc: "https://rpc.pulsechain.com",
-    trace: "block",
-    hint: "Free default is the PulseChain public RPC. trace_filter and both debug methods are missing. trace_block answered, including internal calls, so the scanner uses that.",
+    defaultRpc: "https://rpc-pulsechain.g4mm4.io",
+    // g4mm4 serves trace_filter. The official public RPC does not, and trace_block
+    // there returns the entire block (multi-megabyte). Keep it as a paced fallback.
+    rpcUrls: [
+      "https://rpc-pulsechain.g4mm4.io",
+      "https://rpc.pulsechain.com",
+    ],
+    trace: "filter",
+    hint: "Default is rpc-pulsechain.g4mm4.io, which serves trace_filter. The official rpc.pulsechain.com has no trace_filter. trace_block on that host returns the whole block, often several megabytes, and a 2,000-block loop gets the node to time out or drop calls. The scanner tries trace_filter on every PulseChain endpoint before trace_block, paces trace_block, and stops with a resumable error instead of skipping the rest of the range.",
   },
   {
     chainId: 747474,
@@ -399,6 +405,29 @@ export function rpcForChain(chain) {
     return { url: override.trim(), fromEnv: true };
   }
   return { url: chain.defaultRpc, fromEnv: false };
+}
+
+export function rpcCandidates(chain, explicitUrl = null) {
+  const out = [];
+  const add = (url) => {
+    if (typeof url !== "string") return;
+    const trimmed = url.trim().replace(/\/+$/, "");
+    if (!trimmed || out.includes(trimmed)) return;
+    out.push(trimmed);
+  };
+  if (explicitUrl) add(explicitUrl);
+  else if (chain) add(process.env[`RPC_URL_${chain.chainId}`]);
+  if (Array.isArray(chain?.rpcUrls)) {
+    for (const url of chain.rpcUrls) add(url);
+  }
+  if (chain?.defaultRpc) add(chain.defaultRpc);
+  if (out.length === 0 && chain) add(rpcForChain(chain).url);
+  return out;
+}
+
+export function segmentBlockCap(chain) {
+  if (chain?.trace === "block") return 40;
+  return null;
 }
 
 export function publicHost(url) {

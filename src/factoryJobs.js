@@ -1,4 +1,4 @@
-import { chainById, makeCustomChain, publicHost, rpcForChain } from "./chains.js";
+import { chainById, makeCustomChain, publicHost, rpcForChain, segmentBlockCap } from "./chains.js";
 import { config } from "./config.js";
 import { getDb } from "./db.js";
 import { discoverFactory, scanFunctionFor } from "./factory.js";
@@ -191,7 +191,9 @@ export async function runSavedPoolScan({ scanId, signal, emit, finalEvent = "don
   while (last < target) {
     if (signal?.aborted) break;
     const start = last + 1;
-    const end = Math.min(target, start + config.maxBlocksCap - 1);
+    const heavyCap = segmentBlockCap(chain);
+    const cap = heavyCap == null ? config.maxBlocksCap : Math.min(config.maxBlocksCap, heavyCap);
+    const end = Math.min(target, start + cap - 1);
     emit("log", { level: "info", message: `Segment ${start.toLocaleString("en-US")}–${end.toLocaleString("en-US")}.` });
     const outcome = await runSegment({
       scan,
