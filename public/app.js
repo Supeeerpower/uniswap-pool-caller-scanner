@@ -61,8 +61,8 @@ function renderChains() {
   select.replaceChildren();
   select.append(option("auto", "Auto-detect chain"));
   const groups = [
-    ["Traces on the free default", (chain) => chain.trace === "filter" || chain.trace === "debug"],
-    ["Bring your own trace RPC", (chain) => chain.trace === "none"],
+    ["Free trace RPC", (chain) => chain.trace === "filter" || chain.trace === "block" || chain.trace === "debug" || chain.trace === "tx"],
+    ["Needs a trace-capable RPC", (chain) => chain.trace === "none"],
   ];
   for (const [label, pred] of groups) {
     const group = document.createElement("optgroup");
@@ -407,7 +407,10 @@ function renderProgress(progress) {
   const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
   $("bar").style.width = `${pct}%`;
   const phase = progress.phase === "cancelled" ? "Cancelled" : progress.phase === "done" ? "Finished" : "Scanning";
-  $("progress-text").textContent = `${phase} · ${num.format(done)} / ${num.format(total)} blocks · ${progress.method || "choosing a trace method"} · ${num.format(progress.callers || 0)} contracts · ${num.format(progress.matchedCalls || 0)} matching calls`;
+  const txs = progress.txsTotal
+    ? ` · ${num.format(progress.txsDone || 0)} / ${num.format(progress.txsTotal)} event txs`
+    : "";
+  $("progress-text").textContent = `${phase} · ${num.format(done)} / ${num.format(total)} blocks${txs} · ${progress.method || "choosing a trace method"} · ${num.format(progress.callers || 0)} contracts · ${num.format(progress.matchedCalls || 0)} matching calls`;
 }
 
 function appendLog(line) {
