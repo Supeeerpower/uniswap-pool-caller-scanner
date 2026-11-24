@@ -6,19 +6,36 @@ import { functionCatalog } from "./abi.js";
 import { chainById, chains, examples, makeCustomChain, publicHost, rpcForChain } from "./chains.js";
 import { config } from "./config.js";
 import { normalizeAddress, normalizeRpcUrl } from "./decode.js";
+import { mongoStatus } from "./db.js";
 import { detectPool } from "./detect.js";
+import { createScans, factoryWithPools, listFactories, publicPool, publicScan, runDiscovery, runSavedPoolScan } from "./factoryJobs.js";
 import { getBlockNumber, getChainId } from "./rpc.js";
 import { runScan } from "./scan.js";
 
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const app = express();
 const jobs = new Map();
+let busy = false;
+
+function takeBusy() {
+  if (busy) {
+    const err = new Error("A scan is already running. Cancel it before starting another.");
+    err.status = 409;
+    throw err;
+  }
+  busy = true;
+}
+
+function freeBusy() {
+  busy = false;
+}
 
 app.use(express.json({ limit: "256kb" }));
 app.use(express.static(publicDir, { etag: false, maxAge: 0, index: "index.html" }));
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
+app.get("/api/health", async (_req, res) => {
+  const mongo = await mongoStatus();
+  res.json({ ok: true, mongo });
 });
 
 app.get("/api/meta", (_req, res) => {
@@ -76,8 +93,10 @@ app.post("/api/detect", async (req, res) => {
 });
 
 app.post("/api/scans", (req, res) => {
-  if ([...jobs.values()].some((job) => job.status === "running")) {
-    res.status(409).json({ error: "A scan is already running. Cancel it before starting another." });
+  try {
+    takeBusy();
+  } catch (err) {
+    res.status(409).json({ error: err.message });
     return;
   }
   let request;
@@ -97,7 +116,153 @@ app.post("/api/scans", (req, res) => {
     emit: (event, data) => job.push(event, data),
   }).catch((err) => {
     job.push("error", { message: err.message || String(err) });
-  });
+  }).finally(freeBusy);
+});
+
+app.get("/api/factories", async (_req, res) => {
+  try {
+    const factories = await listFactories();
+    res.json({ factories: factories.map(publicFactory) });
+  } catch (err) {
+    res.status(503).json({ error: `MongoDB is not available. ${err.message}` });
+  }
+});
+
+app.get("/api/factories/:id", async (req, res) => {
+  try {
+    const found = await factoryWithPools(req.params.id);
+    if (!found) {
+      res.status(404).json({ error: "Unknown factory." });
+      return;
+    }
+    res.json({
+      factory: publicFactory(found.factory),
+      pools: found.pools.map(publicPool),
+      scans: found.scans.map(publicScan),
+    });
+  } catch (err) {
+    res.status(503).json({ error: `MongoDB is not available. ${err.message}` });
+  }
+});
+
+app.get("/api/factories/:id/export", async (req, res) => {
+  try {
+    const found = await factoryWithPools(req.params.id);
+    if (!found) {
+      res.status(404).json({ error: "Unknown factory." });
+      return;
+    }
+    const rows = found.pools.map(publicPool);
+    if (req.query.format === "csv") {
+      sendCsv(res, `pools-${found.factory.chainId}.csv`, rows);
+      return;
+    }
+    res.json({ factory: publicFactory(found.factory), pools: rows });
+  } catch (err) {
+    res.status(503).json({ error: err.message });
+  }
+});
+
+app.post("/api/factories/discover", (req, res) => {
+  let chain;
+  let rpcUrl;
+  let factory;
+  let fromBlock = null;
+  let toBlock = null;
+  try {
+    takeBusy();
+    factory = normalizeAddress(req.body?.address);
+    const chainId = parseChainId(req.body?.chainId);
+    if (chainId == null) throw new Error("Pick a chain for factory discovery.");
+    chain = chainById(chainId) || makeCustomChain(chainId);
+    rpcUrl = normalizeRpcUrl(req.body?.rpcUrl) || rpcForChain(chain).url;
+    if (!rpcUrl) throw new Error("This chain needs an RPC URL.");
+    if (req.body?.fromBlock != null && req.body.fromBlock !== "") fromBlock = requireInt(req.body.fromBlock, "Start block");
+    if (req.body?.toBlock != null && req.body.toBlock !== "") toBlock = requireInt(req.body.toBlock, "End block");
+  } catch (err) {
+    if (err.status !== 409) freeBusy();
+    res.status(err.status || 400).json({ error: err.message });
+    return;
+  }
+  const id = randomUUID();
+  const job = createJob();
+  jobs.set(id, job);
+  res.json({ id });
+  runDiscovery({
+    chain,
+    rpcUrl,
+    factory,
+    fromBlock,
+    toBlock,
+    signal: job.abort.signal,
+    onProgress: (progress) => job.push("progress", progress),
+  }).then((result) => {
+    job.push("done", {
+      factoryId: result.id,
+      poolCount: result.poolCount,
+      kind: result.kind,
+      mode: result.mode,
+      head: result.head,
+    });
+  }).catch((err) => {
+    job.push("error", { message: err.message || String(err) });
+  }).finally(freeBusy);
+});
+
+app.post("/api/factories/:id/scan", async (req, res) => {
+  try {
+    takeBusy();
+    const created = await createScans({
+      factoryId: req.params.id,
+      addresses: Array.isArray(req.body?.addresses) ? req.body.addresses : [],
+    });
+    const id = randomUUID();
+    const job = createJob();
+    jobs.set(id, job);
+    res.json({ id, scanIds: created.scanIds, head: created.head });
+    runScanQueue(created.scanIds, job).finally(freeBusy);
+  } catch (err) {
+    if (err.status !== 409) freeBusy();
+    res.status(err.status || 400).json({ error: err.message });
+  }
+});
+
+app.post("/api/saved-scans/:id/resume", (req, res) => {
+  try {
+    takeBusy();
+  } catch (err) {
+    res.status(409).json({ error: err.message });
+    return;
+  }
+  const id = randomUUID();
+  const job = createJob();
+  jobs.set(id, job);
+  res.json({ id, scanId: req.params.id });
+  runSavedPoolScan({
+    scanId: decodeURIComponent(req.params.id),
+    signal: job.abort.signal,
+    emit: (event, data) => job.push(event, data),
+  }).catch((err) => {
+    job.push("error", { message: err.message || String(err) });
+  }).finally(freeBusy);
+});
+
+app.get("/api/saved-scans/:id/export", async (req, res) => {
+  try {
+    const found = await factoryWithPools(req.query.factoryId);
+    const scan = found?.scans?.find((item) => item._id === decodeURIComponent(req.params.id));
+    if (!scan) {
+      res.status(404).json({ error: "Unknown saved scan." });
+      return;
+    }
+    if (req.query.format === "csv") {
+      sendCsv(res, "callers.csv", scan.rows || []);
+      return;
+    }
+    res.json({ scan: publicScan(scan), rows: scan.rows || [] });
+  } catch (err) {
+    res.status(503).json({ error: err.message });
+  }
 });
 
 app.get("/api/scans/:id", (req, res) => {
@@ -269,6 +434,55 @@ function publicDetection(found) {
     rpcHost: publicHost(found.rpcUrl),
     alsoFound: found.alsoFound || [],
   };
+}
+
+async function runScanQueue(scanIds, job) {
+  const finished = [];
+  for (const scanId of scanIds) {
+    if (job.abort.signal.aborted) break;
+    job.push("log", { level: "info", message: `Pool scan ${scanId}` });
+    await runSavedPoolScan({
+      scanId,
+      signal: job.abort.signal,
+      emit: (event, data) => job.push(event, data),
+      finalEvent: "poolDone",
+    });
+    finished.push(scanId);
+  }
+  job.push("done", { status: job.abort.signal.aborted ? "paused" : "done", scanIds: finished });
+}
+
+function publicFactory(doc) {
+  return {
+    id: doc._id,
+    chainId: doc.chainId,
+    chainName: doc.chainName,
+    address: doc.address,
+    kind: doc.kind,
+    mode: doc.mode,
+    poolCount: doc.poolCount,
+    head: doc.head,
+    status: doc.status,
+    rpcHost: doc.rpcHost,
+    explorer: doc.explorer,
+    updatedAt: doc.updatedAt,
+  };
+}
+
+function sendCsv(res, filename, rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const keys = [...new Set(list.flatMap((row) => Object.keys(row).filter((key) => key !== "_id")))];
+  const lines = [keys.join(",")];
+  for (const row of list) lines.push(keys.map((key) => csvCell(row[key])).join(","));
+  res.setHeader("content-type", "text/csv; charset=utf-8");
+  res.setHeader("content-disposition", `attachment; filename="${filename}"`);
+  res.send(`\uFEFF${lines.join("\n")}`);
+}
+
+function csvCell(value) {
+  if (value == null) return "";
+  const text = typeof value === "object" ? JSON.stringify(value) : String(value);
+  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
 const server = app.listen(config.port, "0.0.0.0", () => {

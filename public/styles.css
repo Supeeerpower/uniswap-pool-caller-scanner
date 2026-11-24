@@ -29,6 +29,14 @@ body {
 button, input, select { font: inherit; color: inherit; }
 code, .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
 
+.tabs { max-width: 1240px; margin: 0 auto; padding: 8px 20px 0; display: flex; gap: 8px; }
+.tab { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+.tab.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.factory { max-width: 1240px; margin: 0 auto; padding: 18px 20px 48px; display: grid; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.saved-title { margin: 16px 0 6px; font-size: 16px; }
+.pick { width: auto; accent-color: #b6cc3b; }
+.usd { font-variant-numeric: tabular-nums; }
+.scan-line { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); font-size: 13px; }
 .top {
   display: grid;
   grid-template-columns: minmax(220px, 340px) 1fr;

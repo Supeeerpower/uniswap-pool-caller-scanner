@@ -11,7 +11,39 @@ npm start
 
 Open http://127.0.0.1:47821
 
-`npm test` runs the unit tests (ABI selectors, trace walking, range caps). No RPC key is required for the default chains that answer traces.
+`npm test` runs the unit tests (ABI selectors, trace walking, factory log decoding, USD math). No RPC key is required for the default chains that answer traces.
+
+## MongoDB
+
+Factory lists, pool rows, scan checkpoints, and caller results are stored in MongoDB.
+
+```bash
+docker run -d --name pool-callers-mongo -p 27017:27017 mongo:8
+```
+
+```bash
+MONGODB_URI=mongodb://127.0.0.1:27017
+MONGODB_DB=pool_callers
+```
+
+Both have those defaults, so a MongoDB on port 27017 needs no `.env` entry. If MongoDB is down, one-pool scans still run in memory and the factory routes return 503. `GET /api/health` reports the database ping.
+
+## Factory flow
+
+Open the Factory tab.
+
+1. Pick a chain and a factory address. Optional start and end blocks limit discovery to that range. Leave the start empty to cover the factory's whole life.
+2. **Discover pools.** V2 and Solidly factories are enumerated with `allPairsLength` / `allPairs`. V3, Aerodrome Slipstream, and Algebra factories are read from `PoolCreated` or `Pool` logs back to the deployment block (or the start block you set). Each pool row stores the creation block, token0/token1 address, symbol, decimals, current reserves (`getReserves` on V2/Solidly, token `balanceOf` on V3-style pools), and a USD estimate.
+3. USD prices come from the free DefiLlama coins API (`https://coins.llama.fi/prices/current/{chain}:{address}`). The chain slug map is in `src/prices.js`. If DefiLlama has no price and the symbol is a known stablecoin (USDC, USDT, DAI, and common bridged spellings), the price is $1. Otherwise that side is omitted and the row's USD total only includes the priced side.
+4. Select one pool, several, or **Scan all**. The default range is the pool's creation block through the chain head at the moment the scan starts. V2 and Solidly pools are scanned for `getReserves`. V3, Slipstream, and Algebra pools are scanned for `slot0` (classic Algebra `globalState()` is not the Uniswap selector; forks that kept `slot0` still match).
+5. Every finished chunk writes `lastScannedBlock` and the aggregated caller rows to MongoDB. One request walks creation → head in segments of `MAX_BLOCKS_CAP` blocks (default 2000) and keeps going until the head captured at the start, then through the live head if you resume later. Cancel or a crash leaves the scan `paused`; **Resume** continues from the next block.
+6. **Export pools JSON** saves the discovery table. `GET /api/factories/:id/export?format=csv` and `GET /api/saved-scans/:id/export?factoryId=` do the same for pools and for one pool's callers.
+
+Verified on 24 Nov 2026:
+
+- Katana V2 factory `0x72D111b4d6f31B38919ae39779f570b747d6Acd9`: all 13 pairs, with DefiLlama prices. vbUSDC/vbETH reserves priced at about $48; vbETH/YNGI at about $1,410 (YNGI had no price, so only the ETH side counted).
+- Ethereum V2 factory, blocks 26,485,267–26,486,267: six new pairs. HYPER/WETH `0xb918bd85647d3922a94d167bb4bd147ae0059954` scanned from its creation block 26,485,478 through head 26,486,271. 15 `getReserves` staticcalls, all from Uniswap V2 Router02.
+- Ethereum V3 factory, a 4,500-block window: NONNON/USDT `0xb49d3e76d953c72ea2872893048597108f68db2b` scanned from creation block 26,483,598 through the same head. Two `slot0` staticcalls, one of them from the Uniswap V3 position manager.
 
 ## What you enter
 

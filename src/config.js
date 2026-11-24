@@ -11,7 +11,7 @@ export const config = {
   chunkBlocks: Math.min(50, positive("TRACE_CHUNK_BLOCKS", 20)),
   concurrency: Math.min(6, positive("TRACE_CONCURRENCY", 2)),
   timeoutMs: positive("RPC_TIMEOUT_MS", 45_000),
-  maxBlocksCap: Math.min(10_000, positive("MAX_BLOCKS_CAP", 2000)),
+  maxBlocksCap: Math.min(50_000, positive("MAX_BLOCKS_CAP", 2000)),
   pageSize: Math.min(2000, positive("TRACE_PAGE_SIZE", 400)),
   maxResponseBytes: positive("RPC_MAX_BYTES", 64 * 1024 * 1024),
 };

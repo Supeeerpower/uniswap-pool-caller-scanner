@@ -233,6 +233,7 @@ export async function runScan(request, { emit, signal }) {
         log(`Stopped after ${request.maxTx} matching transactions.`);
       }
       publish("scanning");
+      if (request.ordered) emit("checkpoint", { lastBlock: to, snapshot: materialize() });
     } catch (err) {
       if (err.code === "CANCELLED" || signal?.aborted) {
         cancelFlag = true;
@@ -250,6 +251,7 @@ export async function runScan(request, { emit, signal }) {
       blocksDone += to - from + 1;
       warn(`Blocks ${from}–${to} failed: ${err.message}`);
       publish("scanning");
+      if (request.ordered) emit("checkpoint", { lastBlock: to, snapshot: materialize() });
     }
   }
 
@@ -324,6 +326,7 @@ export async function runScan(request, { emit, signal }) {
   try {
     const functions = functionsById(request.functions);
     aggregator = createAggregator(selectorMap(functions), request.maxTx);
+    if (Array.isArray(request.initialRows) && request.initialRows.length) aggregator.load(request.initialRows);
     detection = await detectPool({
       address: request.address,
       chainId: request.chainId,
@@ -381,7 +384,8 @@ export async function runScan(request, { emit, signal }) {
       const chunkSize = method === "trace_filter" ? config.chunkBlocks : 1;
       const chunks = blockChunks(range.start, range.end, chunkSize);
       publish("scanning");
-      await mapPool(chunks, request.maxTx ? 1 : config.concurrency, async ([from, to]) => {
+      const parallel = request.ordered || request.maxTx ? 1 : config.concurrency;
+      await mapPool(chunks, parallel, async ([from, to]) => {
         await processRange(from, to);
       });
     }

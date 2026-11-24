@@ -18,8 +18,12 @@
     </div>
     <p class="lede">Find contracts that called a pool during a transaction. View functions such as <code>slot0</code> and <code>getReserves</code> emit nothing, so the scan reads execution traces rather than logs.</p>
   </header>
+  <nav class="tabs">
+    <button type="button" id="tab-pool" class="tab on">One pool</button>
+    <button type="button" id="tab-factory" class="tab">Factory</button>
+  </nav>
 
-  <main>
+  <main id="pool-view">
     <form id="scan-form" class="panel controls">
       <div class="row">
         <label class="field">
@@ -141,6 +145,70 @@
       </details>
     </section>
   </main>
+
+  <section id="factory-view" class="factory" hidden>
+    <form id="factory-form" class="panel controls">
+      <label class="field">
+        <span>Chain</span>
+        <select id="factory-chain"></select>
+      </label>
+      <p id="factory-hint" class="hint"></p>
+      <label class="field">
+        <span>Factory contract</span>
+        <input id="factory-address" placeholder="0x…" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="row">
+        <label class="field">
+          <span>Start block <em>optional</em></span>
+          <input id="factory-from" inputmode="numeric" placeholder="deployment">
+        </label>
+        <label class="field">
+          <span>End block <em>optional</em></span>
+          <input id="factory-to" inputmode="numeric" placeholder="head">
+        </label>
+      </div>
+      <p class="hint">V2 and Solidly factories are read with <code>allPairs</code>. V3, Slipstream, and Algebra factories are read from creation events. Leave the start empty to begin at deployment. A start block limits discovery to that range and is the way to sample a huge factory.</p>
+      <div class="examples" id="factory-examples"></div>
+      <div class="row tight">
+        <button type="submit" id="discover">Discover pools</button>
+        <button type="button" id="factory-cancel" class="ghost" hidden>Cancel</button>
+      </div>
+      <p id="factory-error" class="error" hidden></p>
+      <h2 class="saved-title">Saved factories</h2>
+      <div id="saved-factories" class="hint">Loading…</div>
+    </form>
+    <section class="panel results">
+      <div class="results-head">
+        <h2>Pools</h2>
+        <p id="factory-summary" class="hint">Discover a factory to list every pool it created.</p>
+      </div>
+      <div id="factory-log" class="log" hidden></div>
+      <div class="row tight">
+        <button type="button" id="scan-selected" class="ghost" disabled>Scan selected</button>
+        <button type="button" id="scan-all" class="ghost" disabled>Scan all</button>
+        <button type="button" id="export-pools" class="ghost" disabled>Export pools JSON</button>
+      </div>
+      <p class="hint">A pool scan runs from that pool’s creation block through the chain head, looking for <code>getReserves</code> on V2/Solidly and <code>slot0</code> on V3/Slipstream/Algebra. Progress is stored after every chunk.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th></th>
+              <th>Pool</th>
+              <th>Created</th>
+              <th>Pair</th>
+              <th>Balances</th>
+              <th>USD</th>
+            </tr>
+          </thead>
+          <tbody id="pool-rows"></tbody>
+        </table>
+      </div>
+      <h2 class="saved-title">Saved scans</h2>
+      <div id="saved-scans" class="hint">None yet.</div>
+      <div id="factory-callers"></div>
+    </section>
+  </section>
 
   <script type="module" src="/app.js"></script>
 </body>

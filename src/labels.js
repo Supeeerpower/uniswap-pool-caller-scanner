@@ -9,6 +9,7 @@ const LABELS = {
   "0x66a9893cc07d91d95644aedd05d03f95e1dba8af": "Uniswap Universal Router 2",
   "0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b": "Uniswap Universal Router (legacy)",
   "0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6": "Uniswap V3 Quoter",
+  "0xc36442b4a4522e871399cd717abdd847ab11fe88": "Uniswap V3 Positions NFT",
   "0x61ffe014ba17989e743c5f6cb21bf9697530b21e": "Uniswap V3 QuoterV2",
   "0x1111111254fb6c44bac0bed2854e76f90643097d": "1inch Aggregation Router V4",
   "0x1111111254eeb25477b68fb85ed929f73a960582": "1inch Aggregation Router V5",

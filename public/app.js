@@ -54,6 +54,7 @@ async function boot() {
   showHint();
   const defaults = new Set(["v2:getReserves", "v3:slot0"]);
   setChecks((fn) => defaults.has(fn.id));
+  initFactory();
 }
 
 function renderChains() {
@@ -618,4 +619,309 @@ function option(value, label) {
   node.value = value;
   node.textContent = label;
   return node;
+}
+
+const factoryState = { id: null, pools: [], scans: [], source: null, jobId: null };
+
+function initFactory() {
+  const select = $("factory-chain");
+  select.replaceChildren();
+  for (const group of $("chain").querySelectorAll("optgroup")) {
+    select.append(group.cloneNode(true));
+  }
+  $("tab-pool").addEventListener("click", () => setTab("pool"));
+  $("tab-factory").addEventListener("click", () => setTab("factory"));
+  $("factory-chain").addEventListener("change", showFactoryHint);
+  $("factory-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    discoverFactory();
+  });
+  $("factory-cancel").addEventListener("click", cancelFactoryJob);
+  $("scan-selected").addEventListener("click", () => scanPools(false));
+  $("scan-all").addEventListener("click", () => scanPools(true));
+  $("export-pools").addEventListener("click", exportPools);
+  const katana = document.createElement("button");
+  katana.type = "button";
+  katana.className = "ghost";
+  katana.textContent = "Katana V2 factory";
+  katana.addEventListener("click", () => {
+    $("factory-chain").value = "747474";
+    $("factory-address").value = "0x72D111b4d6f31B38919ae39779f570b747d6Acd9";
+    $("factory-from").value = "";
+    $("factory-to").value = "";
+    showFactoryHint();
+  });
+  $("factory-examples").append(katana);
+  showFactoryHint();
+  refreshFactories();
+}
+
+function setTab(which) {
+  $("tab-pool").classList.toggle("on", which === "pool");
+  $("tab-factory").classList.toggle("on", which === "factory");
+  $("pool-view").hidden = which !== "pool";
+  $("factory-view").hidden = which !== "factory";
+}
+
+function showFactoryHint() {
+  const chain = state.meta.chains.find((item) => item.chainId === Number($("factory-chain").value));
+  $("factory-hint").textContent = chain ? chain.hint : "";
+}
+
+async function refreshFactories() {
+  const box = $("saved-factories");
+  try {
+    const res = await fetch("/api/factories");
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+    box.replaceChildren();
+    if (!data.factories.length) {
+      box.textContent = "No factories saved yet.";
+      return;
+    }
+    for (const factory of data.factories) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost";
+      button.textContent = `${factory.chainName} ${shortHex(factory.address)} · ${factory.poolCount} pools`;
+      button.addEventListener("click", () => loadFactory(factory.id));
+      box.append(button);
+    }
+  } catch (err) {
+    box.textContent = err.message;
+  }
+}
+
+async function discoverFactory() {
+  setFactoryError("");
+  const chainId = Number($("factory-chain").value);
+  const address = $("factory-address").value.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    setFactoryError("Enter a factory address.");
+    return;
+  }
+  const body = {
+    address,
+    chainId,
+    fromBlock: $("factory-from").value.trim() || null,
+    toBlock: $("factory-to").value.trim() || null,
+  };
+  $("discover").disabled = true;
+  $("factory-cancel").hidden = false;
+  $("factory-log").hidden = false;
+  $("factory-log").replaceChildren();
+  factoryLog("Discovering pools…");
+  try {
+    const res = await fetch("/api/factories/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+    await listenJob(data.id, async (event, payload) => {
+      if (event === "progress") factoryLog(progressLine(payload));
+      if (event === "done") {
+        factoryState.id = payload.factoryId;
+        await loadFactory(payload.factoryId);
+        await refreshFactories();
+      }
+      if (event === "error") setFactoryError(payload.message);
+    });
+  } catch (err) {
+    setFactoryError(err.message);
+  } finally {
+    $("discover").disabled = false;
+    $("factory-cancel").hidden = true;
+  }
+}
+
+async function loadFactory(id) {
+  const res = await fetch(`/api/factories/${encodeURIComponent(id)}`);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error);
+  factoryState.id = id;
+  factoryState.pools = data.pools;
+  factoryState.scans = data.scans;
+  const factory = data.factory;
+  $("factory-summary").textContent = `${factory.chainName} ${factory.kind} via ${factory.mode} · ${factory.poolCount} pools · ${factory.rpcHost}`;
+  $("factory-address").value = factory.address;
+  if ([...$("factory-chain").options].some((option) => option.value === String(factory.chainId))) {
+    $("factory-chain").value = String(factory.chainId);
+  }
+  renderPoolTable();
+  renderSavedScans();
+  $("scan-selected").disabled = false;
+  $("scan-all").disabled = false;
+  $("export-pools").disabled = false;
+}
+
+function renderPoolTable() {
+  const body = $("pool-rows");
+  body.replaceChildren();
+  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+  for (const pool of factoryState.pools) {
+    const tr = document.createElement("tr");
+    const pick = document.createElement("td");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "pick";
+    box.value = pool.address;
+    pick.append(box);
+    const addr = document.createElement("td");
+    addr.className = "addr";
+    addr.textContent = shortHex(pool.address);
+    addr.title = pool.address;
+    const created = document.createElement("td");
+    created.textContent = pool.creationBlock == null ? "—" : num.format(pool.creationBlock);
+    const pair = document.createElement("td");
+    pair.textContent = `${pool.symbol0 || shortHex(pool.token0)} / ${pool.symbol1 || shortHex(pool.token1)}`;
+    const balances = document.createElement("td");
+    balances.textContent = `${pool.reserve0 ?? "—"} / ${pool.reserve1 ?? "—"}`;
+    const value = document.createElement("td");
+    value.className = "usd";
+    value.textContent = pool.usd == null ? "—" : usd.format(pool.usd);
+    value.title = [pool.price0Source, pool.price1Source].filter(Boolean).join(", ");
+    tr.append(pick, addr, created, pair, balances, value);
+    body.append(tr);
+  }
+}
+
+function renderSavedScans() {
+  const box = $("saved-scans");
+  box.replaceChildren();
+  if (!factoryState.scans.length) {
+    box.textContent = "None yet.";
+    return;
+  }
+  for (const scan of factoryState.scans) {
+    const line = document.createElement("div");
+    line.className = "scan-line";
+    const label = document.createElement("span");
+    const through = scan.lastScannedBlock == null ? "not started" : `through ${num.format(scan.lastScannedBlock)}`;
+    label.textContent = `${scan.symbol0 || ""}/${scan.symbol1 || ""} ${shortHex(scan.address)} · ${scan.status} · ${through} · ${scan.callers} callers`;
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.className = "texty";
+    resume.textContent = scan.status === "done" ? "Run again" : "Resume";
+    resume.addEventListener("click", () => resumeScan(scan));
+    line.append(label, resume);
+    box.append(line);
+  }
+}
+
+async function scanPools(all) {
+  const addresses = all
+    ? []
+    : [...document.querySelectorAll("#pool-rows .pick:checked")].map((box) => box.value);
+  if (!all && addresses.length === 0) {
+    setFactoryError("Select at least one pool, or use Scan all.");
+    return;
+  }
+  setFactoryError("");
+  await postFactoryJob(`/api/factories/${encodeURIComponent(factoryState.id)}/scan`, { addresses });
+}
+
+async function resumeScan(scan) {
+  if (scan.status === "done") {
+    await postFactoryJob(`/api/factories/${encodeURIComponent(factoryState.id)}/scan`, { addresses: [scan.address] });
+    return;
+  }
+  await postFactoryJob(`/api/saved-scans/${encodeURIComponent(scan.id)}/resume`, {});
+}
+
+async function postFactoryJob(url, body) {
+  $("factory-log").hidden = false;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error);
+  factoryState.jobId = data.id;
+  $("factory-cancel").hidden = false;
+  await listenJob(data.id, async (event, payload) => {
+    if (event === "log") factoryLog(payload.message);
+    if (event === "poolDone" || event === "done") {
+      renderCallerSnapshot(payload);
+      if (factoryState.id) await loadFactory(factoryState.id);
+    }
+    if (event === "error") setFactoryError(payload.message);
+  });
+  $("factory-cancel").hidden = true;
+}
+
+function renderCallerSnapshot(payload) {
+  const box = $("factory-callers");
+  const rows = payload.rows || [];
+  if (!rows.length) return;
+  box.replaceChildren();
+  const title = document.createElement("h2");
+  title.className = "saved-title";
+  title.textContent = "Latest caller results";
+  box.append(title);
+  for (const row of rows.slice(0, 12)) {
+    const line = document.createElement("div");
+    line.className = "scan-line";
+    line.textContent = `${row.count} × ${row.functionName} · ${row.label || row.caller}`;
+    box.append(line);
+  }
+}
+
+async function exportPools() {
+  const res = await fetch(`/api/factories/${encodeURIComponent(factoryState.id)}/export`);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error);
+  download(JSON.stringify(data, null, 2), "pools.json", "application/json");
+}
+
+async function listenJob(id, onEvent) {
+  await new Promise((resolve, reject) => {
+    const source = new EventSource(`/api/scans/${id}/events`);
+    factoryState.source = source;
+    const finish = () => {
+      source.close();
+      factoryState.source = null;
+      resolve();
+    };
+    for (const name of ["progress", "log", "poolDone", "done", "error", "snapshot"]) {
+      source.addEventListener(name, (event) => {
+        let payload = null;
+        try { payload = JSON.parse(event.data); } catch { payload = {}; }
+        Promise.resolve(onEvent(name, payload)).catch((err) => setFactoryError(err.message));
+        if (name === "done" || name === "error") finish();
+      });
+    }
+    source.addEventListener("error", () => {
+      if (source.readyState === EventSource.CLOSED) finish();
+    });
+  });
+}
+
+async function cancelFactoryJob() {
+  if (!factoryState.jobId) return;
+  await fetch(`/api/scans/${factoryState.jobId}/cancel`, { method: "POST" });
+}
+
+function factoryLog(message) {
+  if (!message) return;
+  const line = document.createElement("div");
+  line.textContent = message;
+  $("factory-log").append(line);
+  $("factory-log").scrollTop = $("factory-log").scrollHeight;
+}
+
+function progressLine(progress) {
+  if (progress.phase === "enumerate") return `Reading pairs ${progress.done || 0} / ${progress.total || "?"}`;
+  if (progress.phase === "creation") return `Creation blocks ${progress.done || 0} / ${progress.total || "?"}`;
+  if (progress.phase === "metadata") return `Token metadata ${progress.done || 0} / ${progress.total || "?"}`;
+  if (progress.phase === "logs") return `Logs through ${progress.lastBlock} · ${progress.found || 0} pools`;
+  return JSON.stringify(progress);
+}
+
+function setFactoryError(message) {
+  const el = $("factory-error");
+  el.hidden = !message;
+  el.textContent = message || "";
 }

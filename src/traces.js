@@ -147,8 +147,33 @@ export function createAggregator(selectorMap, maxTx = null) {
     };
   }
 
+  function load(savedRows) {
+    for (const row of savedRows || []) {
+      const caller = String(row.caller || "").toLowerCase();
+      const selector = String(row.selector || "").toLowerCase();
+      if (!caller || !selector) continue;
+      const key = `${caller}|${selector}`;
+      if (rows.has(key)) continue;
+      rows.set(key, {
+        caller,
+        selector,
+        functionName: row.functionName,
+        signature: row.signature,
+        version: row.version,
+        callTypes: [...(row.callTypes || [])],
+        count: row.count || 0,
+        firstBlock: row.firstBlock,
+        lastBlock: row.lastBlock,
+        exampleTx: row.exampleTx || null,
+        exampleTrace: row.exampleTrace || "",
+      });
+      matched += row.count || 0;
+    }
+  }
+
   return {
     add,
+    load,
     snapshot,
     get stopped() {
       return stopped;
