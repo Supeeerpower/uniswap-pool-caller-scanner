@@ -1,0 +1,18 @@
+{
+  "name": "pool-callers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Find contracts that called a Uniswap v2 or v3 pool, including view calls that emit no events.",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ethers": "^6.15.0",
+    "express": "^4.21.2"
+  }
+}

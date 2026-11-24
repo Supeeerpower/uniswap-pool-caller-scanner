@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pool callers</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23161a12'/%3E%3Cpath d='M6 22 V10 h4.2 c2.4 0 3.8 1.2 3.8 3.1 0 1.4-.8 2.4-2 2.9 1.5.4 2.4 1.5 2.4 3.1 0 2.1-1.6 3.4-4.2 3.4H6zm3.2-7.2h1.1c1 0 1.6-.5 1.6-1.3s-.6-1.3-1.6-1.3H9.2v2.6zm0 2.2v2.8h1.4c1.1 0 1.8-.5 1.8-1.4s-.7-1.4-1.8-1.4H9.2zM18 22l3.3-12H25l3.3 12h-3.3l-.5-2h-3.2l-.5 2H18zm3.4-4.4h2.1L22.4 13l-1 4.6z' fill='%23dff25a'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">Uniswap v2 / v3 · internal calls</p>
+      <h1>Pool callers</h1>
+    </div>
+    <p class="lede">Find contracts that called a pool during a transaction. View functions such as <code>slot0</code> and <code>getReserves</code> emit nothing, so the scan reads execution traces rather than logs.</p>
+  </header>
+
+  <main>
+    <form id="scan-form" class="panel controls">
+      <div class="row">
+        <label class="field">
+          <span>Chain</span>
+          <select id="chain" name="chain"></select>
+        </label>
+        <label class="field" id="custom-chain-field" hidden>
+          <span>Chain ID</span>
+          <input id="custom-chain-id" inputmode="numeric" placeholder="137">
+        </label>
+      </div>
+      <p id="chain-hint" class="hint"></p>
+
+      <label class="field">
+        <span>RPC URL <em>optional</em></span>
+        <input id="rpc" name="rpc" type="url" placeholder="https://… overrides the default for this scan" autocomplete="off" spellcheck="false">
+      </label>
+
+      <label class="field">
+        <span>Pool contract</span>
+        <input id="address" name="address" required placeholder="0x…" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="row tight">
+        <button type="button" id="detect" class="ghost">Detect pool</button>
+        <button type="button" id="recent" class="ghost">Use latest blocks</button>
+      </div>
+      <p id="detect-out" class="hint"></p>
+
+      <div class="examples" id="examples"></div>
+
+      <div class="row">
+        <label class="field">
+          <span>Start block</span>
+          <input id="start" inputmode="numeric" required placeholder="deployed block, or a recent height">
+        </label>
+        <label class="field">
+          <span>End block <em>optional</em></span>
+          <input id="end" inputmode="numeric" placeholder="latest if empty">
+        </label>
+      </div>
+      <div class="row">
+        <label class="field">
+          <span>Max blocks</span>
+          <input id="max-blocks" inputmode="numeric" value="20">
+        </label>
+        <label class="field">
+          <span>Max matching txs <em>optional</em></span>
+          <input id="max-tx" inputmode="numeric" placeholder="no cap">
+        </label>
+      </div>
+      <p class="hint">Leave the end block empty to scan this many blocks from the start, stopping at the chain head. Max blocks also caps a wide start–end range.</p>
+
+      <div class="fn-head">
+        <span>Functions</span>
+        <div class="row tight">
+          <button type="button" class="texty" id="fn-v2">V2 views</button>
+          <button type="button" class="texty" id="fn-v3">V3 views</button>
+          <button type="button" class="texty" id="fn-clear">Clear</button>
+        </div>
+      </div>
+      <div id="functions" class="fn-grid"></div>
+      <p class="hint">Each selector is the first 4 bytes of keccak256 of the canonical signature.</p>
+
+      <div class="row tight actions">
+        <button type="submit" id="go">Scan</button>
+        <button type="button" id="csv" class="ghost" disabled>Export CSV</button>
+        <button type="button" id="json" class="ghost" disabled>Export JSON</button>
+      </div>
+      <p id="form-error" class="error" hidden></p>
+
+      <details class="limits">
+        <summary>What a scan cannot see</summary>
+        <ul>
+          <li>Off-chain <code>eth_call</code> reads never land in a block. No RPC can list them.</li>
+          <li>The address in the table is the immediate caller, not the transaction sender. The sender is an extra column when the tx lookup succeeds.</li>
+          <li>Free trace endpoints are uneven. Some chains need your own RPC, and a quiet or pruned range can come back empty.</li>
+          <li>EOAs are dropped after <code>eth_getCode</code>, including EIP-7702 delegated accounts. A failed code lookup is kept and marked unknown.</li>
+        </ul>
+      </details>
+    </form>
+
+    <section class="panel results" aria-live="polite">
+      <div class="results-head">
+        <h2>Callers</h2>
+        <p id="summary" class="hint">No scan yet. Load an example or fill the form.</p>
+      </div>
+      <div id="warnings"></div>
+      <div class="progress" hidden id="progress-wrap">
+        <div class="bar" aria-hidden="true"><span id="bar"></span></div>
+        <p id="progress-text" class="hint"></p>
+      </div>
+      <div id="log" class="log" hidden></div>
+      <div class="table-tools">
+        <label class="filter">
+          <span class="sr">Filter results</span>
+          <input id="filter" placeholder="Filter by address, label, or function" autocomplete="off">
+        </label>
+        <p id="count-line" class="hint"></p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th><button type="button" data-sort="caller">Caller</button></th>
+              <th><button type="button" data-sort="functionName">Function</button></th>
+              <th><button type="button" data-sort="count">Calls</button></th>
+              <th><button type="button" data-sort="firstBlock">First block</button></th>
+              <th><button type="button" data-sort="lastBlock">Last block</button></th>
+              <th>Example tx</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <p id="empty" class="empty">Results land here. Contracts only — an EOA that called the pool directly is listed under the disclosure below, not in the table.</p>
+      <details id="excluded-wrap" hidden>
+        <summary id="excluded-summary">EOAs hidden</summary>
+        <ul id="excluded"></ul>
+      </details>
+    </section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
